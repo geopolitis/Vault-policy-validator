@@ -1,16 +1,15 @@
 from collections import defaultdict
 from typing import Dict, List
 
-def find_overlapping_acls(rules: List[dict]):
-    """Detect same normalized paths defined more than once."""
-    path_map = defaultdict(list)
+def find_overlapping_acls(rules: List[dict]) -> Dict[str, List[dict]]:
+    path_map: Dict[str, List[dict]] = defaultdict(list)
     for rule in rules:
         norm_path = rule['path'].replace('*', '')
         path_map[norm_path].append(rule)
     return {p: r for p, r in path_map.items() if len(r) > 1}
 
-def suggest_optimizations(overlaps: Dict[str, List[dict]]):
-    suggestions = []
+def suggest_optimizations(overlaps: Dict[str, List[dict]]) -> List[str]:
+    suggestions: List[str] = []
     for path, rules in overlaps.items():
         all_caps = set()
         for rule in rules:
@@ -21,9 +20,8 @@ def suggest_optimizations(overlaps: Dict[str, List[dict]]):
         )
     return suggestions
 
-def risky_grants_lint(rules: List[dict]):
-    """Optional: flag very broad grants for awareness."""
-    warnings = []
+def risky_grants_lint(rules: List[dict]) -> List[str]:
+    warnings: List[str] = []
     risky = {"delete", "sudo", "recover"}
     for r in rules:
         if r['path'] in ("*", "/*", "secret/*") or r['path'].endswith("*"):

@@ -2,10 +2,9 @@ import re
 
 def match_path(policy_path: str, request_path: str) -> bool:
     """
-    Vault-like match:
+    Vault-like path matching:
     - '+' matches exactly one non-slash segment
-    - '*' is a glob only if it is the final character: prefix match
-    - Any other '*' usage is invalid and treated as non-match (the parser should already flag it)
+    - '*' is a trailing glob only
     """
     rx = re.escape(policy_path)
     rx = rx.replace(r'\+', r'[^/]+')

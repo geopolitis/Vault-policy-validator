@@ -1,12 +1,14 @@
+
+
 from functools import cmp_to_key
-from typing import List, Tuple, Set
+from typing import List, Set, Tuple
 import matcher
 
 def _first_wildcard_pos(p: str) -> int:
     plus = p.find('+')
     star = p.find('*')
     positions = [i for i in (plus, star) if i != -1]
-    return min(positions) if positions else 10**9  # large number == "no wildcard"
+    return min(positions) if positions else 10**9
 
 def compare_policy_paths(p1: str, p2: str) -> int:
     """
@@ -38,12 +40,8 @@ def compare_policy_paths(p1: str, p2: str) -> int:
 
     return 0
 
-def check_policies(policies, request_path: str, operation: str) -> Tuple[List[tuple], Set[str]]:
-    """
-    policies: [{"name": <str>, "rules": [{"path": <str>, "capabilities": [str]}]}]
-    Returns: (best_matches, effective_caps)
-    """
-    matching = []
+def check_policies(policies: List[dict], request_path: str, operation: str) -> Tuple[List[tuple], Set[str]]:
+    matching: List[tuple] = []
     for policy in policies:
         for rule in policy['rules']:
             if matcher.match_path(rule['path'], request_path):
@@ -52,13 +50,11 @@ def check_policies(policies, request_path: str, operation: str) -> Tuple[List[tu
     if not matching:
         return [], set()
 
-    # Sort by priority (highest first) using comparator
     matching.sort(key=cmp_to_key(lambda a, b: compare_policy_paths(a[1]['path'], b[1]['path'])))
     best_path = matching[0][1]['path']
 
-    # Union capabilities across SAME PATTERN from different policies
     best_matches = [m for m in matching if m[1]['path'] == best_path]
-    all_caps = set()
+    all_caps: Set[str] = set()
     for _, rule in best_matches:
         all_caps.update(rule['capabilities'])
 
