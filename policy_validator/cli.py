@@ -1,4 +1,3 @@
-# vault_policy_validator/cli.py
 from __future__ import annotations
 
 import argparse
@@ -6,9 +5,9 @@ import json
 import sys
 from typing import Any, Dict, List, Tuple
 
-from vault_policy_validator.parser import hcl_syntax_check, parse_vault_policy, CAPABILITIES
-from vault_policy_validator.priority import check_policies
-from vault_policy_validator.lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
+from policy_validator.parser import hcl_syntax_check, parse_vault_policy, CAPABILITIES
+from policy_validator.priority import check_policies
+from policy_validator.lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -45,8 +44,8 @@ def main(argv: List[str] | None = None) -> int:
         return 1
 
     # 2) Parse policies
-    rules: List[dict] = parse_vault_policy(policy_text)
-    policies: List[dict] = [{"name": args.file, "rules": rules}]
+    rules: List[Dict[str, Any]] = parse_vault_policy(policy_text)
+    policies: List[Dict[str, Any]] = [{"name": args.file, "rules": rules}]
 
     # 3) Capability check
     matches, all_caps = check_policies(policies, args.path, args.cap)
@@ -82,8 +81,8 @@ def main(argv: List[str] | None = None) -> int:
                 print(f"- Pattern: {rule['path']} from policy {name} with capabilities {rule['capabilities']}")
             print(f"\nEffective capabilities: {sorted(all_caps)}")
 
-        overlaps = find_overlapping_acls(rules)
-        risky = risky_grants_lint(rules)
+        overlaps: Dict[str, List[Dict[str, Any]]] = find_overlapping_acls(rules)
+        risky: List[str] = risky_grants_lint(rules)
         if overlaps:
             print("\nOverlapping ACLs detected:")
             for path, ruleset in overlaps.items():

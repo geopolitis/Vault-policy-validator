@@ -1,10 +1,11 @@
+from __future__ import annotations
 import re
 
 def match_path(policy_path: str, request_path: str) -> bool:
     """
     Vault-like path matching:
     - '+' matches exactly one non-slash segment
-    - '*' is a trailing glob only
+    - '*' is a trailing glob only (prefix match)
     """
     rx = re.escape(policy_path)
     rx = rx.replace(r'\+', r'[^/]+')

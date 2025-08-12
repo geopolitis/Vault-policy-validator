@@ -1,10 +1,10 @@
 import pytest
-from main import (
-    hcl_syntax_check,
-    parse_vault_policy,
-    check_policies,
-    VALID_CAPS
-)
+from policy_validator.parser import parse_vault_policy, hcl_syntax_check, CAPABILITIES
+from policy_validator.priority import check_policies
+from policy_validator.lints import find_overlapping_acls, risky_grants_lint
+from policy_validator import VALID_CAPS
+
+
 
 def test_happy_path():
     policy_text = '''

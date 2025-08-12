@@ -1,20 +1,21 @@
+from __future__ import annotations
 import re
 import ast
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any, Set
 
 CAPABILITIES: List[str] = [
-    "create",   # POST/PUT
-    "read",     # GET
-    "update",   # POST/PUT
-    "patch",    # PATCH
-    "delete",   # DELETE
-    "list",     # LIST
+    "create",   
+    "read",     
+    "update",   
+    "patch",    
+    "delete",   
+    "list",    
     "sudo",
     "deny",
     "subscribe",
     "recover",
 ]
-VALID_CAPS: set[str] = set(CAPABILITIES)
+VALID_CAPS: Set[str] = set(CAPABILITIES)
 
 PATH_BLOCK_RE = re.compile(r'path\s+"([^"]+)"\s*\{([^}]+)\}', re.DOTALL)
 CAPS_RE = re.compile(r'capabilities\s*=\s*\[([^\]]+)\]')
@@ -90,9 +91,9 @@ def hcl_syntax_check(policy_text: str) -> List[str]:
 
     return errors
 
-def parse_vault_policy(policy_text: str) -> List[dict]:
-    """Return list of rules: [{path: str, capabilities: [str]}]."""
-    rules: List[dict] = []
+def parse_vault_policy(policy_text: str) -> List[Dict[str, Any]]:
+    """Return list of rules: [{'path': str, 'capabilities': List[str]}]."""
+    rules: List[Dict[str, Any]] = []
     for path, block in PATH_BLOCK_RE.findall(policy_text):
         m = CAPS_RE.search(block)
         if not m:
