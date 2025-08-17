@@ -1,81 +1,240 @@
+# ui.py
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple, Set
+from typing import List, Dict, Any
+from pathlib import Path
+import os
 import streamlit as st
 
+# --- Import from package or local files ---
 try:
-    # when installed as a package or PYTHONPATH points to repo root
     from policy_validator.parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
     from policy_validator.priority import check_policies
     from policy_validator.lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
-except ModuleNotFoundError:  # fallback when running as a module inside the package
-    from .parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
-    from .priority import check_policies
-    from .lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
+except Exception:
+    from parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy  # type: ignore
+    from priority import check_policies  # type: ignore
+    from lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint  # type: ignore
 
+# --- Page config ---
+st.set_page_config(
+    page_title="Vault Policy Permission Checker",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def _render_errors(errors: List[str]) -> None:
-    if errors:
-        st.error("HCL Syntax Error(s) detected:")
-        for err in errors:
-            st.write(f"- {err}")
+# ========= Sidebar helpers =========
+def _risk_counts(risky_msgs: List[str]) -> Dict[str, int]:
+    low = [m.lower() for m in risky_msgs]
+    return {
+        "high": sum("[high]" in m for m in low),
+        "low": sum("[low]" in m for m in low),
+        "risky": sum(("risky" in m) or ("wildcard" in m) for m in low),
+    }
 
-def main() -> None:
-    st.title("Vault Policy Permission Checker (HCL Policy Format)")
-    st.markdown(
-        "Paste your Vault policy blocks below. This tool validates HCL-like blocks and "
-        "checks if a requested capability is granted on a path using Vault's documented priority rules."
-    )
-    st.markdown("**Supported capabilities**:\n" + "\n".join(f"- `{cap}`" for cap in CAPABILITIES))
+def show_statistics_sidebar(stats: Dict[str, int], mode_label: str) -> None:
+    st.sidebar.markdown("### Statistics")
+    st.sidebar.write(f"- Mode: {mode_label}")
+    st.sidebar.write(f"- Files searched: {stats.get('files', 0)}")
+    st.sidebar.write(f"- Policies parsed: {stats.get('policies', 0)}")
+    st.sidebar.write(f"- Syntax errors: {stats.get('syntax', 0)}")
+    st.sidebar.write(f"- Overlapping ACL paths: {stats.get('overlaps', 0)}")
+    st.sidebar.write(f"- High risk findings: {stats.get('high', 0)}")
+    st.sidebar.write(f"- Low risk findings: {stats.get('low', 0)}")
+    st.sidebar.write(f"- Risky findings: {stats.get('risky', 0)}")
 
-    request_path: str = st.text_input("Request Path", value="")
-    operation: str = st.selectbox("Operation / Capability to Check", CAPABILITIES)
-    st.markdown("**Vault Policy (HCL format)**")
-    policy_text: str = st.text_area("Paste Vault policy blocks here", value="", height=400)
+def filter_by_severity(messages: List[str], severity: str) -> List[str]:
+    if severity == "all":
+        return messages
+    s = severity.lower()
+    if s == "syntax":
+        return [m for m in messages if "syntax" in m.lower()]
+    if s == "high":
+        return [m for m in messages if "[high]" in m.lower()]
+    if s == "low":
+        return [m for m in messages if "[low]" in m.lower()]
+    if s == "risky":
+        return [m for m in messages if "risky" in m.lower() or "wildcard" in m.lower()]
+    return messages
 
-    hcl_errors: List[str] = hcl_syntax_check(policy_text)
-    _render_errors(hcl_errors)
+# ========= Sidebar controls (ALL the functionality you wanted visible) =========
+st.sidebar.title("Vault Policy Checker")
+st.sidebar.info("Load a file or scan a folder, choose severity filtering, and run permission checks.")
 
-    rules: List[Dict[str, Any]] = parse_vault_policy(policy_text)
-    policies: List[Dict[str, Any]] = [{"name": "inline", "rules": rules}]
+mode = st.sidebar.radio("Mode", ["Single file", "Scan folder"], index=0)
 
-    if st.button("Check Permission"):
-        if hcl_errors:
-            st.warning("Please fix HCL syntax errors before checking permissions.")
+severity = st.sidebar.selectbox(
+    "Filter by severity",
+    ["all", "high", "low", "syntax", "risky"],
+    index=0,
+    help="Filter visible messages by severity tag/type.",
+)
+
+# Request path & capability (moved to sidebar so all controls are in one place)
+request_path = st.sidebar.text_input("Request Path (e.g., secret/data/foo/bar)", value="")
+operation = st.sidebar.selectbox("Operation / Capability", CAPABILITIES)
+
+# Single-file controls
+use_paste = False
+uploaded_file = None
+pasted_text = ""
+
+if mode == "Single file":
+    use_paste = st.sidebar.checkbox("Paste text instead of uploading a file", value=False)
+    if use_paste:
+        st.sidebar.caption("Scroll to the main area to paste policy text.")
+    else:
+        uploaded_file = st.sidebar.file_uploader("Upload policy (.hcl, .txt)", type=["hcl", "txt"])
+
+# Folder scan controls
+folder = ""
+exts = ""
+do_scan = False
+if mode == "Scan folder":
+    folder = st.sidebar.text_input("Folder path to scan (server-side path)", value="")
+    exts = st.sidebar.text_input("Include extensions (comma-separated)", value=".hcl,.txt,.policy")
+    do_scan = st.sidebar.button("Scan folder")
+
+# ========= Main Area =========
+st.title("Vault Policy Permission Checker (HCL Policy Format)")
+st.caption("Validates HCL-like blocks, flags risks/overlaps, and checks capability resolution.")
+
+# ---------------- Single file mode ----------------
+if mode == "Single file":
+    if use_paste:
+        policy_text = st.text_area("Paste Vault policy blocks here", value="", height=320)
+    else:
+        if uploaded_file is not None:
+            policy_text = uploaded_file.read().decode("utf-8", errors="replace")
         else:
-            matches, all_caps = check_policies(policies, request_path, operation)
+            policy_text = ""
+
+    # Parse & lint
+    hcl_errors: List[str] = hcl_syntax_check(policy_text) if policy_text.strip() else []
+    rules: List[Dict[str, Any]] = parse_vault_policy(policy_text) if not hcl_errors else []
+    overlaps = find_overlapping_acls(rules) if rules else {}
+    risky_msgs = risky_grants_lint(rules) if rules else []
+
+    # Sidebar stats
+    stats = {
+        "files": 1 if (policy_text.strip() or (uploaded_file is not None)) else 0,
+        "policies": len(rules),
+        "syntax": len(hcl_errors),
+        "overlaps": len(overlaps),
+        **_risk_counts(risky_msgs),
+    }
+    show_statistics_sidebar(stats, "Single file")
+
+    # Render messages
+    if hcl_errors:
+        for m in filter_by_severity(hcl_errors, severity):
+            st.error(m)
+
+    if rules:
+        if overlaps:
+            st.warning("Overlapping ACLs detected for the following paths:")
+            for path, ruleset in overlaps.items():
+                st.write(f"- `{path}` appears in {len(ruleset)} rules:")
+                for rule in ruleset:
+                    st.write(f"   - Capabilities: {rule.get('capabilities')}")
+            for s in suggest_optimizations(overlaps):
+                st.info(f"- {s}")
+        for m in filter_by_severity(risky_msgs, severity):
+            if "[high]" in m.lower():
+                st.error(m)
+            else:
+                st.warning(m)
+
+        # Permission check
+        if st.button("Check Permission"):
+            matches, all_caps = check_policies([{"name": "inline", "rules": rules}], request_path, operation)
             if not matches:
                 st.error("No matching rules found for this path.")
             else:
                 if "deny" in all_caps:
-                    st.error("Permission DENIED due to explicit 'deny' capability on the highest-priority match.")
+                    st.error("Permission DENIED due to explicit `deny` on the highest-priority match.")
                 elif operation in all_caps:
-                    st.success("Permission GRANTED by the highest-priority pattern:")
+                    st.success("Permission GRANTED by the highest-priority match.")
                 else:
-                    st.error("Permission DENIED: No policy grants this capability on the path.")
-                    st.info(f"Effective capabilities at this priority: {sorted(all_caps)}")
+                    st.warning("Operation not explicitly granted by the highest-priority match.")
+                with st.expander("Matched rules (by priority)"):
+                    for name, r in matches:
+                        st.write(f"- `{r['path']}` → caps: {sorted(r.get('capabilities', []))}")
 
-                for name, rule in matches:
-                    st.write(f"- Pattern: `{rule['path']}` from policy `{name}` with capabilities {rule['capabilities']}")
-                st.write(f"**Effective capabilities:** {sorted(all_caps)}")
+# ---------------- Folder scan mode ----------------
+else:
+    total_files = 0
+    total_policies = 0
+    total_syntax = 0
+    total_overlaps: Dict[str, Any] = {}
+    total_risk = {"high": 0, "low": 0, "risky": 0}
+    messages: List[str] = []
 
-    if rules:
-        overlaps = find_overlapping_acls(rules)
-        if overlaps:
-            st.warning("Overlapping ACLs detected for the following paths:")
-            for path, ruleset in overlaps.items():
-                st.write(f"- {path} appears in {len(ruleset)} rules:")
-                for rule in ruleset:
-                    st.write(f"    - Capabilities: {rule['capabilities']}")
-            for s in suggest_optimizations(overlaps):
-                st.info(f"- {s}")
+    if do_scan and folder.strip():
+        folder_path = Path(folder)
+        if not folder_path.exists() or not folder_path.is_dir():
+            st.error("Folder not found or not a directory.")
+        else:
+            include_exts = {e.strip().lower() for e in exts.split(",") if e.strip()}
 
-        for w in risky_grants_lint(rules):
-            st.warning(w)
+            files = []
+            for root, _, filenames in os.walk(folder_path):
+                for fn in filenames:
+                    p = Path(root) / fn
+                    if p.suffix.lower() in include_exts:
+                        files.append(p)
 
-    if policy_text.strip() and not hcl_errors and not find_overlapping_acls(rules):
-        st.success("No overlapping ACLs detected. Your policy is optimized.")
+            total_files = len(files)
+            for file_path in files:
+                try:
+                    text = file_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    messages.append(f"Syntax: Error reading {file_path}: {e}")
+                    continue
 
-    st.caption("Note: Only 'capabilities' are checked; attributes like 'control_group' are ignored for now.")
+                hcl_errs = hcl_syntax_check(text)
+                rules = parse_vault_policy(text) if not hcl_errs else []
+                ovs = find_overlapping_acls(rules) if rules else {}
+                risks = risky_grants_lint(rules) if rules else []
 
-if __name__ == "__main__":
-    main()
+                total_policies += len(rules)
+                total_syntax += len(hcl_errs)
+                for k, v in ovs.items():
+                    total_overlaps.setdefault(k, []).extend(v)
+                rc = _risk_counts(risks)
+                for k in ("high", "low", "risky"):
+                    total_risk[k] += rc[k]
+
+                # Collect messages (filtered)
+                messages.extend(filter_by_severity(hcl_errs, severity))
+                if ovs:
+                    messages.append("Overlapping ACLs detected for:")
+                    for path, ruleset in ovs.items():
+                        messages.append(f"- `{path}` appears in {len(ruleset)} rules")
+                    for s in suggest_optimizations(ovs):
+                        messages.append(f"- {s}")
+                messages.extend(filter_by_severity(risks, severity))
+
+    # Sidebar stats always visible (even before scan → zeros)
+    stats = {
+        "files": total_files,
+        "policies": total_policies,
+        "syntax": total_syntax,
+        "overlaps": len(total_overlaps),
+        **total_risk,
+    }
+    show_statistics_sidebar(stats, "Scan folder")
+
+    # Render results
+    if messages:
+        st.subheader("Scan Results")
+        for m in messages:
+            if "syntax" in m.lower():
+                st.error(m)
+            elif m.lower().startswith("overlapping acls"):
+                st.warning(m)
+            elif "[high]" in m.lower():
+                st.error(m)
+            else:
+                st.warning(m)
+
+st.caption("Note: Only `capabilities` are checked; attributes like `control_group` are ignored for now.")
