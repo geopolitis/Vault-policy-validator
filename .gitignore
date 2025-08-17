@@ -1,2 +1,7 @@
 __pycache__
 policy_validator.egg-info/
+build/
+dist/
+*.pyc
+*.pyo
+*.pyd

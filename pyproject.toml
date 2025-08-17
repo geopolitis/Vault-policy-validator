@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "policy_validator"
-version = "0.1.0"
+version = "0.1.10"
 description = "Vault policy validation tool with priority rules, lints, and Streamlit UI."
 authors = [
     { name = "George Politis" }
