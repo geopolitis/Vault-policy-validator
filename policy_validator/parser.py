@@ -71,43 +71,58 @@ def preprocess_policy(policy_text: str) -> Tuple[str, bool]:
 
 def hcl_syntax_check(policy_text: str) -> List[str]:
     """
-    Lightweight structural validation + capability validation hints.
+    Lightweight HCL-like validation and capability validation.
     Returns a list of error/warning messages (strings).
     """
     errors: List[str] = []
 
-    # Preprocess to remove commented-out lines
+    # Remove commented-out lines at the beginning of lines (keep inline comments simple)
     policy_text, had_comments = preprocess_policy(policy_text)
     if had_comments:
         errors.append("[low] Commented-out rules detected (lines starting with #). Consider removing them.")
 
-    # Very lightweight structural checks (heuristics; keep them gentle)
+    # Very lightweight structural checks
     if policy_text.count('"') % 2 != 0:
         errors.append('Unmatched double quote (").')
     if policy_text.count('{') != policy_text.count('}'):
         errors.append("Unmatched curly brace ({ or }).")
 
-    # Find path blocks in BOTH syntaxes
-    path_blocks = []
+    # Collect both syntaxes: path(".."){..} and path ".." {..}
+    path_blocks: List[Tuple[str, str]] = []
     path_blocks += PATH_BLOCK_PAREN_RE.findall(policy_text)
     path_blocks += PATH_BLOCK_LABEL_RE.findall(policy_text)
-
     if not path_blocks:
         errors.append("No valid 'path' blocks found.")
         return errors
 
-    # Validate each block
     for path, block in path_blocks:
-        # Optional sanity check about glob placement (adjust to your rules)
+        # star-in-the-middle should be flagged
         if "*" in path and not path.endswith("*"):
-            errors.append(f"Invalid glob in path '{path}': '*' is only allowed as the final character.")
+            errors.append(f'Invalid glob in path "{path}": "*" is only allowed as the final character.')
 
         caps_match = CAPS_RE.search(block)
         if not caps_match:
             errors.append(f"Missing or malformed 'capabilities' in block for path: '{path}'")
             continue
 
-        _, parse_err = _normalize_caps_value(caps_match.group(1), path)
+        raw = caps_match.group(1).strip()
+
+        # Detect unquoted/bareword tokens inside a capabilities list (e.g., [read, list])
+        if raw.startswith("[") and raw.endswith("]"):
+            inner = raw[1:-1]
+            # Strip quoted strings, then find barewords
+            inner_no_quotes = re.sub(r'"[^"]*"', "", inner)
+            bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner_no_quotes)
+            if bare:
+                errors.append(
+                    f"Capabilities list syntax error in path '{path}': Invalid or unquoted capabilities {bare}. "
+                    "Must be quoted strings, e.g. [\"read\", \"list\"]."
+                )
+                # Skip further validation for this block to avoid duplicate messages
+                continue
+
+        # Normalize and validate capability names (allows list, single quoted, or single bareword)
+        caps_list, parse_err = _normalize_caps_value(raw, path)
         if parse_err:
             errors.append(parse_err)
 

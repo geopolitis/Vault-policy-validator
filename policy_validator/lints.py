@@ -3,10 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Any
 
 def find_overlapping_acls(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Detect overlapping ACLs where the exact same path pattern appears in more than one rule.
-    Preserves the original path string (including '*' or '+') for accurate reporting.
-    """
+    """Return mapping of path -> list of rules that share the same path."""
     path_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in rules:
         path = str(r.get("path", ""))
@@ -14,44 +11,54 @@ def find_overlapping_acls(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
     return {p: rs for p, rs in path_map.items() if len(rs) > 1}
 
 def suggest_optimizations(overlaps: Dict[str, List[Dict[str, Any]]]) -> List[str]:
-    """
-    Suggest merging ACLs with identical path patterns into a single rule with combined capabilities.
-    """
-    suggestions: List[str] = []
-    for path, rules in overlaps.items():
-        all_caps = set()
-        for r in rules:
-            for c in r.get("capabilities", []):
-                all_caps.add(c)
-        suggestions.append(
-            f"For path '{path}' found {len(rules)} ACLs. "
-            f"Consider merging into one with capabilities: {sorted(all_caps)}."
-        )
-    return suggestions
+    tips: List[str] = []
+    for path, rs in overlaps.items():
+        caps_sets = [tuple(sorted(set(r.get("capabilities", [])))) for r in rs]
+        if len(set(caps_sets)) == 1:
+            tips.append(f"Merge {len(rs)} identical rules for `{path}` into a single block.")
+    return tips
 
 def risky_grants_lint(rules: List[Dict[str, Any]]) -> List[str]:
-    """
-    Detect overly broad wildcard paths that grant high-risk capabilities.
-    Adds a high-risk warning for paths starting with '+/', '*/' or similar.
-    Also flags any wildcard path ('*' or '+') that grants risky capabilities.
-    """
     warnings: List[str] = []
-    # Capabilities considered risky in combination with wildcards
-    risky = {"delete", "sudo", "recover", "read"}  # 'read' included for very broad wildcards
+    risky = {"create", "update", "patch", "delete", "sudo"}
     for r in rules:
         path = str(r.get("path", ""))
-        # High-risk: path starts with +/ or */ (very broad first segment wildcard)
+        caps = set(r.get("capabilities", []))
+
+        if "sudo" in caps:
+            warnings.append(f"[high] `sudo` granted on `{path}`")
+
         if path.startswith("+/") or path.startswith("*/"):
             warnings.append(
-                f"[HIGH] Path '{path}' starts with a broad wildcard (+/ or */). This is extremely risky. "
-                "Consider restricting the path."
+                f"[high] Path '{path}' starts with a broad wildcard (+/ or */). "
+                "This is extremely risky. Consider restricting the path."
             )
-        # Existing wildcard risk detection
+
         if ("*" in path) or ("+" in path):
-            bad = sorted(risky.intersection(set(r.get("capabilities", []))))
+            bad = sorted(risky.intersection(caps))
             if bad:
                 warnings.append(
-                    f"[HIGH] wildcard path '{path}' grants high-risk capabilities {bad}. "
+                    f"[high] wildcard path '{path}' grants high-risk capabilities {bad}. "
                     "Consider narrowing the path."
                 )
+            elif caps == {"read"}:
+                warnings.append(f"[low] read-only wildcard on `{path}`")
     return warnings
+
+# Centralized tiny helpers used by UI/CLI
+def risk_counts(messages: List[str]) -> Dict[str, int]:
+    lower = [m.lower() for m in messages]
+    return {
+        "high": sum("[high]" in m for m in lower),
+        "low": sum("[low]" in m for m in lower),
+        "risky": sum(("risky" in m) or ("wildcard" in m) for m in lower),
+    }
+
+def filter_by_severity(messages: List[str], severity: str) -> List[str]:
+    s = (severity or "all").lower()
+    if s == "all": return messages
+    if s == "syntax": return [m for m in messages if "syntax" in m.lower()]
+    if s == "high": return [m for m in messages if "[high]" in m.lower()]
+    if s == "low": return [m for m in messages if "[low]" in m.lower()]
+    if s == "risky": return [m for m in messages if "risky" in m.lower() or "wildcard" in m.lower()]
+    return messages

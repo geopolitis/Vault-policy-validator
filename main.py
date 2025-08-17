@@ -1,23 +1,24 @@
-# main.py
 from __future__ import annotations
 from typing import List, Dict, Any
 from pathlib import Path
-import os
 import streamlit as st
 
-# ---- Use your real modules (package or local fallback) ----
 try:
     from policy_validator.parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
     from policy_validator.priority import check_policies
-    from policy_validator.lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
+    from policy_validator.lints import (
+        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
+        risk_counts, filter_by_severity,
+    )
 except Exception:
-    from parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy  # type: ignore
-    from priority import check_policies  # type: ignore
-    from lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint  # type: ignore
+    from parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy   
+    from priority import check_policies   
+    from lints import (   
+        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
+        risk_counts, filter_by_severity,
+    )
 
-# ---- Page config ----
-st.set_page_config(page_title="Vault Policy Permission Checker",
-                   layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vault Policy Permission Checker", layout="wide", initial_sidebar_state="expanded")
 
 # ---- Session defaults ----
 def _init_state():
@@ -29,26 +30,9 @@ def _init_state():
     st.session_state.setdefault("stats", {"files":0,"policies":0,"syntax":0,"overlaps":0,"high":0,"low":0,"risky":0})
     st.session_state.setdefault("request_path", "")
     st.session_state.setdefault("operation", CAPABILITIES[0])
-    # interaction flags
     st.session_state.setdefault("load_clicked", False)
     st.session_state.setdefault("check_policy_clicked", False)
 _init_state()
-
-# ---- Helpers ----
-def _risk_counts(risky_msgs: List[str]) -> Dict[str, int]:
-    lower = [m.lower() for m in risky_msgs]
-    return {"high": sum("[high]" in m for m in lower),
-            "low": sum("[low]" in m for m in lower),
-            "risky": sum(("risky" in m) or ("wildcard" in m) for m in lower)}
-
-def _filter_by_severity(msgs: List[str], sev: str) -> List[str]:
-    if sev == "all": return msgs
-    s = sev.lower()
-    if s == "syntax": return [m for m in msgs if "syntax" in m.lower()]
-    if s == "high":   return [m for m in msgs if "[high]" in m.lower()]
-    if s == "low":    return [m for m in msgs if "[low]" in m.lower()]
-    if s == "risky":  return [m for m in msgs if "risky" in m.lower() or "wildcard" in m.lower()]
-    return msgs
 
 def _compute_and_store(policy_text: str) -> None:
     hcl_errors: List[str] = hcl_syntax_check(policy_text) if policy_text.strip() else []
@@ -59,7 +43,7 @@ def _compute_and_store(policy_text: str) -> None:
              "policies": len(rules),
              "syntax": len(hcl_errors),
              "overlaps": len(overlaps),
-             **_risk_counts(risky_msgs)}
+             **risk_counts(risky_msgs)}
     st.session_state.policy_text = policy_text
     st.session_state.rules = rules
     st.session_state.hcl_errors = hcl_errors
@@ -69,6 +53,7 @@ def _compute_and_store(policy_text: str) -> None:
 
 def _show_stats_sidebar(stats: Dict[str, int], mode_label: str) -> None:
     with st.sidebar:
+        st.markdown("---")
         st.markdown("### Statistics")
         st.write(f"- Mode: {mode_label}")
         st.write(f"- Files searched: {stats.get('files', 0)}")
@@ -79,36 +64,26 @@ def _show_stats_sidebar(stats: Dict[str, int], mode_label: str) -> None:
         st.write(f"- Low risk findings: {stats.get('low', 0)}")
         st.write(f"- Risky findings: {stats.get('risky', 0)}")
 
-# ---- Sidebar (controls + stats) ----
+# ---- Sidebar (stable order: Mode → Load/Scan → Request → Filter → Stats) ----
 with st.sidebar:
     st.title("Vault Policy Checker")
 
-    mode = st.radio("Loading", ["Single file", "Scan folder"], index=0, key="mode")
-
-    # Request path + capability
-    # st.session_state.request_path = st.text_input("Request Path (e.g., secret/data/foo/bar)",
-    #                                              value=st.session_state.request_path, key="req_path_in_sidebar")
-    # st.session_state.operation = st.selectbox("Operation / Capability", CAPABILITIES,
-    #                                          index=CAPABILITIES.index(st.session_state.operation),
-    #                                          key="op_in_sidebar")
-
+    mode = st.radio("Load Policy", ["Single file", "Scan folder"], index=0, key="mode")
     if mode == "Single file":
-        use_paste = st.checkbox("Paste text instead of uploading a file", value=False, key="use_paste")
-        if not use_paste:
-            # Use stable key so file persists across reruns
-            st.file_uploader("Upload policy (.hcl, .txt)", type=["hcl", "txt"], key="uploaded_policy")
-            # Button sets a flag; processing happens later in main area
-            st.button("Load File", key="btn_load_file",
-                      on_click=lambda: st.session_state.update(load_clicked=True))
+        source = st.radio("Source", ["Upload file", "Paste text"], index=0, key="source")
+        if source == "Upload file":
+            st.file_uploader("Policy file (.hcl, .txt)", type=["hcl", "txt"], key="uploaded_policy")
+            st.button("Load File", key="btn_load_file", on_click=lambda: st.session_state.update(load_clicked=True))
         else:
-            st.caption("Paste your policy text on the main page and press **Check Policy**.")
+            st.caption("Paste your policy in the big box on the main page and click **Check Policy**.")
     else:
-        st.text_input("Folder path to scan (server-side path)", value="", key="folder_path")
-        st.text_input("Include extensions (comma-separated)", value=".hcl,.txt,.policy", key="folder_exts")
-        st.button("Scan folder", key="btn_scan_folder",
-                  on_click=lambda: st.session_state.update(do_scan=True))
-        
-    severity = st.selectbox("Filter by severity", ["all", "high", "low", "syntax", "risky"], index=0, key="severity")
+        st.subheader("Scan a folder")
+        st.text_input("Folder path (server-side)", value=st.session_state.get("folder_path",""), key="folder_path")
+        st.text_input("Include extensions (comma-separated)", value=st.session_state.get("folder_exts",".hcl,.txt,.policy"), key="folder_exts")
+        st.button("Scan folder", key="btn_scan_folder", on_click=lambda: st.session_state.update(do_scan=True))
+
+    st.subheader("Filter")
+    st.selectbox("Severity", ["all", "high", "low", "syntax", "risky"], index=0, key="severity")
 
 # ---- Main page ----
 st.title("Vault Policy Permission Checker (HCL Policy Format)")
@@ -118,43 +93,31 @@ left, right = st.columns([2, 1])
 with left:
     st.text_input("Request Path", value=st.session_state.request_path, key="request_path_main")
 with right:
-    st.selectbox("Operation / Capability", CAPABILITIES,
-                 index=CAPABILITIES.index(st.session_state.operation), key="operation_main")
+    st.selectbox("Operation / Capability", CAPABILITIES, index=CAPABILITIES.index(st.session_state.operation), key="operation_main")
 
-# SINGLE FILE MODE
 if st.session_state.mode == "Single file":
-    # Big editor (when paste is selected)
-    if st.session_state.use_paste:
-        st.text_area("Policy (paste here)", value=st.session_state.policy_text,
-                     height=320, key="policy_text_input")
-        st.button("Check Policy", key="btn_check_policy",
-                  on_click=lambda: st.session_state.update(check_policy_clicked=True))
-        # If clicked, compute
+    if st.session_state.source == "Paste text":
+        st.text_area("Policy (paste here)", value=st.session_state.policy_text, height=320, key="policy_text_input")
+        st.button("Check Policy", key="btn_check_policy", on_click=lambda: st.session_state.update(check_policy_clicked=True))
         if st.session_state.check_policy_clicked:
             _compute_and_store(st.session_state.policy_text_input)
             st.session_state.check_policy_clicked = False
     else:
-        # If Load File clicked, read uploaded file from session and compute
         if st.session_state.load_clicked:
             uf = st.session_state.get("uploaded_policy")
             if uf is None:
                 st.warning("No file selected. Choose a file in the sidebar, then click **Load File**.")
             else:
-                try:
-                    file_text = uf.getvalue().decode("utf-8", errors="replace")
-                except Exception:
-                    file_text = uf.read().decode("utf-8", errors="replace")
+                file_text = uf.getvalue().decode("utf-8", errors="replace")
                 _compute_and_store(file_text)
             st.session_state.load_clicked = False
 
-    # Sidebar stats always reflect current session
     _show_stats_sidebar(st.session_state.stats, "Single file")
 
-    # Results
     st.subheader("Results")
     if st.session_state.hcl_errors:
         st.error("HCL Syntax Error(s):")
-        for m in _filter_by_severity(st.session_state.hcl_errors, st.session_state.severity):
+        for m in filter_by_severity(st.session_state.hcl_errors, st.session_state.severity):
             st.write(f"- {m}")
 
     if st.session_state.rules:
@@ -169,7 +132,7 @@ if st.session_state.mode == "Single file":
             for s in suggest_optimizations(st.session_state.overlaps):
                 st.info(f"- {s}")
 
-        for m in _filter_by_severity(st.session_state.risky_msgs, st.session_state.severity):
+        for m in filter_by_severity(st.session_state.risky_msgs, st.session_state.severity):
             (st.error if "[high]" in m.lower() else st.warning)(m)
 
         if st.button("Check Permission for Path", key="btn_check_perm"):
@@ -192,11 +155,8 @@ if st.session_state.mode == "Single file":
                     for _, r in matches:
                         st.write(f"- `{r['path']}` → caps: {sorted(r.get('capabilities', []))}")
 
-# SCAN FOLDER MODE
 else:
-    total_files = 0
-    total_policies = 0
-    total_syntax = 0
+    total_files = total_policies = total_syntax = 0
     total_overlaps: Dict[str, Any] = {}
     total_risk = {"high": 0, "low": 0, "risky": 0}
 
@@ -239,14 +199,14 @@ else:
                     total_syntax += len(hcl_errs)
                     for k, v in ovs.items():
                         total_overlaps.setdefault(k, []).extend(v)
-                    rc = _risk_counts(risks)
+                    rc = risk_counts(risks)
                     for k in ("high", "low", "risky"):
                         total_risk[k] += rc[k]
 
                     with st.expander(f"{file_path}"):
                         if hcl_errs:
                             st.error("Syntax Errors:")
-                            for m in _filter_by_severity(hcl_errs, st.session_state.severity):
+                            for m in filter_by_severity(hcl_errs, st.session_state.severity):
                                 st.write(f"- {m}")
                         if rules:
                             st.markdown("**Rules:**")
@@ -258,10 +218,9 @@ else:
                                     st.write(f"- `{p}` appears in {len(rs)} rules")
                                 for s in suggest_optimizations(ovs):
                                     st.info(f"- {s}")
-                            for m in _filter_by_severity(risks, st.session_state.severity):
+                            for m in filter_by_severity(risks, st.session_state.severity):
                                 (st.error if "[high]" in m.lower() else st.warning)(m)
 
-    # Sidebar stats for folder mode
     folder_stats = {"files": total_files, "policies": total_policies, "syntax": total_syntax,
                     "overlaps": len(total_overlaps), **total_risk}
     _show_stats_sidebar(folder_stats, "Scan folder")

@@ -2,9 +2,12 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[project.scripts]
+policy-validator = "policy_validator.cli:main"
+
 [project]
 name = "policy_validator"
-version = "0.1.10"
+version = "0.1.12"
 description = "Vault policy validation tool with priority rules, lints, and Streamlit UI."
 authors = [
     { name = "George Politis" }
@@ -17,3 +20,21 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+
+[tool.pytest.ini_options]
+addopts = "-q --cov=policy_validator --cov-report=term-missing --cov-branch --cov-fail-under=85"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["policy_validator"]
+branch = true
+# omit UI files if you don’t want Streamlit lowering coverage:
+omit = [
+  "policy_validator/main.py",
+  "policy_validator/ui.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

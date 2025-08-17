@@ -1,220 +1,238 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple, Set
-import streamlit as st
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
 
 try:
-    from policy_validator.parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
+    from policy_validator.parser import hcl_syntax_check, parse_vault_policy
     from policy_validator.priority import check_policies
-    from utils import find_overlapping_acls, suggest_optimizations, risky_grants_lint
-except ModuleNotFoundError:
-    from ..parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
-    from ..priority import check_policies
-    from ..utils import find_overlapping_acls, suggest_optimizations, risky_grants_lint
+    from policy_validator.lints import (
+        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
+        risk_counts, filter_by_severity,
+    )
+except Exception:
+    from parser import hcl_syntax_check, parse_vault_policy  # type: ignore
+    from priority import check_policies  # type: ignore
+    from lints import (  # type: ignore
+        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
+        risk_counts, filter_by_severity,
+    )
 
-import importlib.metadata
-version = importlib.metadata.version("policy_validator")
-
-def _render_errors(errors: List[str]) -> None:
-    if errors:
-        st.error("HCL Syntax Error(s) detected:")
-        for err in errors:
-            st.write(f"- {err}")
-
-def filter_by_severity(messages, severity):
-    if severity == "all":
-        return messages
-    if severity == "syntax":
-        return [m for m in messages if "Syntax" in m or "syntax" in m]
-    if severity == "high":
-        return [m for m in messages if "[HIGH]" in m]
-    if severity == "low":
-        return [m for m in messages if "[low]" in m]
-    if severity == "risky":
-        return [m for m in messages if "Risky" in m or "risky" in m or "Wildcard path" in m]
-    return messages
-
-def get_risk_counts(risky: list[str]) -> dict:
+def analyze_text(text: str, severity: str = "all") -> Dict[str, Any]:
+    hcl_errors: List[str] = hcl_syntax_check(text) if text.strip() else []
+    rules: List[Dict[str, Any]] = parse_vault_policy(text) if not hcl_errors else []
+    overlaps = find_overlapping_acls(rules) if rules else {}
+    risky_msgs = risky_grants_lint(rules) if rules else []
+    stats = {
+        "files": 1 if text.strip() else 0,
+        "policies": len(rules),
+        "syntax": len(hcl_errors),
+        "overlaps": len(overlaps),
+        **risk_counts(risky_msgs),
+    }
     return {
-        "high": len([m for m in risky if "[HIGH]" in m]),
-        "low": len([m for m in risky if "[low]" in m]),
-        "risky": len([m for m in risky if "risky" in m.lower() or "wildcard path" in m.lower()]),
+        "rules": rules,
+        "errors": filter_by_severity(hcl_errors, severity),
+        "overlaps": overlaps,
+        "risky": filter_by_severity(risky_msgs, severity),
+        "stats": stats,
     }
 
-def show_statistics_sidebar(stats: dict, mode: str):
-    if mode == "Single file":
-        st.sidebar.markdown("### File Statistics")
-    else:
-        st.sidebar.markdown("### Folder Scan Statistics")
+def load_policies_from_folder(folder: Path, exts: str, severity: str):
+    include_exts = {e.strip().lower() for e in exts.split(",") if e.strip()}
+    policies: List[Dict[str, Any]] = []
+    totals = {"files": 0, "policies": 0, "syntax": 0, "overlaps": 0, "high": 0, "low": 0, "risky": 0}
+    per_file: List[Dict[str, Any]] = []
 
-    st.sidebar.write(f"- Files searched: {stats.get('files', 0)}")
-    st.sidebar.write(f"- Policies parsed: {stats.get('policies', 0)}")
-    st.sidebar.write(f"- Syntax errors: {stats.get('syntax', 0)}")
-    st.sidebar.write(f"- Overlapping ACL paths: {stats.get('overlaps', 0)}")
-    st.sidebar.write(f"- High risk findings: {stats.get('high', 0)}")
-    st.sidebar.write(f"- Low risk findings: {stats.get('low', 0)}")
-    st.sidebar.write(f"- Risky findings: {stats.get('risky', 0)}")
-
-def main() -> None:
-    st.title("Vault Policy Permission Checker (HCL Policy Format)")
-
-    # Sidebar: mode, severity, file/folder selection
-    st.sidebar.header("Options")
-    mode = st.sidebar.radio("Mode", ["Single file", "Scan folder"])
-    severity = st.sidebar.selectbox("Filter by severity", ["all", "high", "low", "syntax", "risky"], index=0,
-                                    help="Show only messages of the selected severity")
-
-    uploaded_file = None
-    folder_path = ""
-
-    if mode == "Single file":
-        uploaded_file = st.sidebar.file_uploader("Upload a policy file (.hcl)", type=["hcl"])
-    else:
+    files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in include_exts]
+    for fp in files:
         try:
-            folder = st.sidebar.directory_uploader("Select a folder to scan", key="folder_scan")
-            if folder:
-                folder_path = folder.name if hasattr(folder, "name") else ""
-        except Exception:
-            folder_path = st.sidebar.text_input("Folder to scan (absolute or relative path)")
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            res = {"file": str(fp), "rules": [], "errors": [f"Read error: {e}"], "overlaps": {}, "risky": [], "stats": {"files": 1, "policies": 0, "syntax": 1, "overlaps": 0, "high": 0, "low": 0, "risky": 0}}
+            per_file.append(res)
+            totals["files"] += 1
+            totals["syntax"] += 1
+            continue
 
-    st.markdown("**Supported capabilities:** " + ", ".join(f"`{cap}`" for cap in CAPABILITIES))
-    request_path = st.text_input("Request Path", value="/")
-    operation = st.selectbox("Operation / Capability to Check", CAPABILITIES)
+        res = analyze_text(text, severity)
+        res["file"] = str(fp)
+        per_file.append(res)
 
-    # Policy text area
-    policy_text = ""
-    if uploaded_file is not None:
-        uploaded_content = uploaded_file.read().decode("utf-8")
-        policy_text = st.text_area("Paste policy block here", value=uploaded_content, height=400)
+        totals["files"] += 1
+        totals["policies"] += res["stats"]["policies"]
+        totals["syntax"] += res["stats"]["syntax"]
+        totals["overlaps"] += res["stats"]["overlaps"]
+        totals["high"] += res["stats"]["high"]
+        totals["low"] += res["stats"]["low"]
+        totals["risky"] += res["stats"]["risky"]
+
+        if res["rules"]:
+            policies.append({"name": fp.name, "rules": res["rules"]})
+
+    return policies, totals, per_file
+
+def run_permission_check(policies: List[Dict[str, Any]], req_path: str, capability: str, show_matches: bool = False) -> int:
+    if not policies:
+        print("No policies to evaluate.", file=sys.stderr)
+        return 1
+    if not req_path:
+        print("Missing --check-path.", file=sys.stderr)
+        return 1
+    if not capability:
+        print("Missing --cap.", file=sys.stderr)
+        return 1
+
+    matches, all_caps = check_policies(policies, req_path, capability)
+
+    if not matches:
+        print("No matching rules found for this path.")
+        return 3
+
+    if "deny" in all_caps:
+        print("Permission: DENIED (explicit 'deny' present at highest-priority).")
+        code = 2
+    elif capability in all_caps:
+        print("Permission: GRANTED.")
+        code = 0
     else:
-        policy_text = st.text_area("Paste Vault policy blocks here", value="", height=400)
+        print("Permission: NOT EXPLICITLY GRANTED.")
+        code = 3
 
-    if mode == "Single file":
-        hcl_errors: List[str] = hcl_syntax_check(policy_text)
-        _render_errors(filter_by_severity(hcl_errors, severity))
+    if show_matches:
+        print("\nMatched rules (by priority):")
+        for name, r in matches:
+            caps = sorted(r.get("capabilities", []))
+            print(f"- {name}: path \"{r.get('path','')}\" -> {caps}")
 
-        rules: List[Dict[str, Any]] = parse_vault_policy(policy_text)
-        policies: List[Dict[str, Any]] = [{"name": "inline", "rules": rules}]
+    return code
 
-        if st.button("Check Permission"):
-            if hcl_errors:
-                st.warning("Please fix HCL syntax errors before checking permissions.")
-            else:
-                matches, all_caps = check_policies(policies, request_path, operation)
-                if not matches:
-                    st.error("No matching rules found for this path.")
-                else:
-                    if "deny" in all_caps:
-                        st.error("Permission DENIED due to explicit 'deny' capability on the highest-priority match.")
-                    elif operation in all_caps:
-                        st.success("Permission GRANTED by the highest-priority pattern:")
-                    else:
-                        st.error("Permission DENIED: No policy grants this capability on the path.")
-                    st.info(f"Effective capabilities at this priority: {sorted(all_caps)}")
+def main():
+    ap = argparse.ArgumentParser(description="Vault policy validator (CLI)")
+    ap.add_argument("path", help="Policy file or folder")
+    ap.add_argument("--severity", choices=["all","high","low","syntax","risky"], default="all")
+    ap.add_argument("--exts", default=".hcl,.txt,.policy", help="Comma-separated extensions (folder mode)")
+    ap.add_argument("--check-path", dest="check_path", default="", help="Path to evaluate (e.g., secret/data/foo/bar)")
+    ap.add_argument("--cap", dest="capability", default="", help="Capability to evaluate (e.g., read)")
+    ap.add_argument("--show-matches", action="store_true", help="Print the matched rules")
+    ap.add_argument("--json", action="store_true", help="Print JSON output")
+    args = ap.parse_args()
 
-                    for name, rule in matches:
-                        st.write(f"- Pattern: `{rule['path']}` from policy `{name}` with capabilities `{rule['capabilities']}`")
+    target = Path(args.path)
+    exit_code = 0
 
-        # Show filtered overlaps and risky grants
-        messages = []
-        overlaps = find_overlapping_acls(rules)
-        risky = risky_grants_lint(rules)
+    if target.is_file():
+        text = target.read_text(encoding="utf-8", errors="replace")
+        res = analyze_text(text, args.severity)
 
-        if overlaps:
-            messages.append("Overlapping ACLs detected for the following paths:")
-            for path, ruleset in overlaps.items():
-                messages.append(f"- `{path}` appears in {len(ruleset)} rules:")
-                for rule in ruleset:
-                    messages.append(f"   - Capabilities: {rule['capabilities']}")
-            for s in suggest_optimizations(overlaps):
-                messages.append(f"- {s}")
-
-        messages.extend(risky)
-
-        for msg in filter_by_severity(messages, severity):
-            st.warning(msg)
-
-        if policy_text.strip() and not hcl_errors and not overlaps:
-            st.success("No overlapping ACLs detected. Your policy is optimized.")
-
-        # Show statistics in the sidebar for single file
-        risk_counts = get_risk_counts(risky)
-        stats = {
-            "policies": len(rules),
-            "syntax": len(hcl_errors),
-            "overlaps": len(overlaps),
-            **risk_counts,
-        }
-        show_statistics_sidebar(stats, mode="Single file")
-
-    else:  # Scan folder mode
-        if st.button("Scan Folder", disabled=not folder_path):
-            import os
-            files = []
-            total_policies = 0
-            total_overlaps = set()
-            total_syntax = 0
-            total_risk = {"high": 0, "low": 0, "risky": 0}
-            for root, _, fs in os.walk(folder_path):
-                for f in fs:
-                    if f.lower().endswith(".hcl"):
-                        files.append(os.path.join(root, f))
-
-            if not files:
-                st.warning("No .hcl files found in the folder.")
-            else:
-                for file_path in files:
-                    st.write(f"**Validating:** `{file_path}`")
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            policy_text = f.read()
-                    except Exception as e:
-                        st.error(f"Error reading {file_path}: {e}")
-                        continue
-
-                    hcl_errors = hcl_syntax_check(policy_text)
-                    rules = parse_vault_policy(policy_text)
-                    total_policies += len(rules)
-                    overlaps = find_overlapping_acls(rules)
-                    total_overlaps.update(overlaps.keys())
-                    risky = risky_grants_lint(rules)
-                    rc = get_risk_counts(risky)
-
-                    total_syntax += len([m for m in hcl_errors if "syntax" in m.lower()])
-                    total_risk["high"] += rc["high"]
-                    total_risk["low"] += rc["low"]
-                    total_risk["risky"] += rc["risky"]
-
-                    messages = []
-                    if hcl_errors:
-                        messages.extend(hcl_errors)
-                    if overlaps:
-                        messages.append("Overlapping ACLs detected for the following paths:")
-                        for path, ruleset in overlaps.items():
-                            messages.append(f"- `{path}` appears in {len(ruleset)} rules:")
-                            for rule in ruleset:
-                                messages.append(f"   - Capabilities: {rule['capabilities']}")
-                        for s in suggest_optimizations(overlaps):
-                            messages.append(f"- {s}")
-                    messages.extend(risky)
-
-                    for msg in filter_by_severity(messages, severity):
-                        st.warning(msg)
-
-                    if policy_text.strip() and not hcl_errors and not overlaps:
-                        st.success("No overlapping ACLs detected. Your policy is optimized.")
-
-                # Show statistics in the sidebar for folder scan
-                stats = {
-                    "files": len(files),
-                    "policies": total_policies,
-                    "syntax": total_syntax,
-                    "overlaps": len(total_overlaps),
-                    **total_risk,
+        if args.json:
+            payload = {
+                "file": str(target),
+                "stats": res["stats"],
+                "errors": res["errors"],
+                "overlaps": {k: len(v) for k, v in (res["overlaps"] or {}).items()},
+                "risky": res["risky"],
+            }
+            if args.check_path and args.capability:
+                pols = [{"name": target.name, "rules": res["rules"]}]
+                matches, all_caps = check_policies(pols, args.check_path, args.capability)
+                payload["permission_check"] = {
+                    "path": args.check_path,
+                    "capability": args.capability,
+                    "granted": args.capability in all_caps and "deny" not in all_caps,
+                    "denied": "deny" in all_caps,
+                    "matched_count": len(matches),
+                    "matched": [
+                        {"policy": name, "path": r.get("path",""), "capabilities": r.get("capabilities", [])}
+                        for name, r in matches
+                    ] if args.show_matches else None,
                 }
-                show_statistics_sidebar(stats, mode="Scan folder")
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"File: {target}")
+            print("Stats:", res["stats"])
+            if res["errors"]:
+                print("\nSyntax errors:")
+                for e in res["errors"]:
+                    print("-", e)
+            if res["overlaps"]:
+                print("\nOverlaps:")
+                for k, v in res["overlaps"].items():
+                    print(f"- {k} -> {len(v)} rules")
+                for s in suggest_optimizations(res["overlaps"]):
+                    print("-", s)
+            if res["risky"]:
+                print("\nRisk findings:")
+                for m in res["risky"]:
+                    print("-", m)
 
-    st.caption("Note: Only `capabilities` are checked; attributes like `control_group` are ignored for now.")
-    st.caption(f"Version: `{version}`")
+            if args.check_path and args.capability:
+                pols = [{"name": target.name, "rules": res["rules"]}]
+                exit_code = run_permission_check(pols, args.check_path, args.capability, args.show_matches)
+
+    elif target.is_dir():
+        policies, totals, per_file = load_policies_from_folder(target, args.exts, args.severity)
+
+        if args.json:
+            payload = {
+                "folder": str(target),
+                "totals": totals,
+                "files": [
+                    {
+                        "file": r.get("file"),
+                        "stats": r.get("stats"),
+                        "errors": r.get("errors"),
+                        "overlaps": {k: len(v) for k, v in (r.get("overlaps") or {}).items()},
+                        "risky": r.get("risky"),
+                    }
+                    for r in per_file
+                ],
+            }
+            if args.check_path and args.capability:
+                matches, all_caps = check_policies(policies, args.check_path, args.capability)
+                payload["permission_check"] = {
+                    "path": args.check_path,
+                    "capability": args.capability,
+                    "granted": args.capability in all_caps and "deny" not in all_caps,
+                    "denied": "deny" in all_caps,
+                    "matched_count": len(matches),
+                    "matched": [
+                        {"policy": name, "path": r.get("path",""), "capabilities": r.get("capabilities", [])}
+                        for name, r in matches
+                    ] if args.show_matches else None,
+                }
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Folder: {target}")
+            print("Totals:", totals)
+
+            for r in per_file:
+                if r["errors"] or r["overlaps"] or r["risky"]:
+                    print(f"\n{r['file']}:")
+                    if r["errors"]:
+                        print("  Syntax errors:")
+                        for e in r["errors"]:
+                            print("   -", e)
+                    if r["overlaps"]:
+                        print("  Overlaps:")
+                        for k, v in r["overlaps"].items():
+                            print(f"   - {k} -> {len(v)} rules")
+                        for s in suggest_optimizations(r["overlaps"]):
+                            print("   -", s)
+                    if r["risky"]:
+                        print("  Risk findings:")
+                        for m in r["risky"]:
+                            print("   -", m)
+
+            if args.check_path and args.capability:
+                exit_code = run_permission_check(policies, args.check_path, args.capability, args.show_matches)
+    else:
+        print("Path is neither a file nor a folder", file=sys.stderr)
+        return 1
+
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
