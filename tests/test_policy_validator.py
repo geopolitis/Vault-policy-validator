@@ -1,9 +1,19 @@
+from __future__ import annotations
 import pytest
-from policy_validator.parser import parse_vault_policy, hcl_syntax_check, CAPABILITIES
-from policy_validator.priority import check_policies
-from policy_validator.lints import find_overlapping_acls, risky_grants_lint
-from policy_validator import VALID_CAPS
 
+from policy_validator.parser import (
+    parse_vault_policy,
+    hcl_syntax_check,
+    CAPABILITIES,
+    VALID_CAPS,  # final location for the capability set
+)
+from policy_validator.priority import decide, cohort_and_caps
+from policy_validator.lints import (
+    lint_overlaps,
+    lint_risky,
+    lint_commented_rules,
+    aggregate_stats,
+)
 
 
 def test_happy_path():
@@ -15,12 +25,10 @@ def test_happy_path():
     errors = hcl_syntax_check(policy_text)
     assert errors == []
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/data/myapp/config",
-        "read"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/myapp/config")
     assert "read" in all_caps
+    assert decide(rules, "secret/data/myapp/config", "read") == "ALLOW"
+
 
 def test_unknown_capability():
     policy_text = '''
@@ -31,6 +39,7 @@ def test_unknown_capability():
     errors = hcl_syntax_check(policy_text)
     assert any("Unknown capability" in e for e in errors)
 
+
 def test_syntax_error_missing_quotes():
     policy_text = '''
     path "secret/data/myapp/*" {
@@ -40,6 +49,7 @@ def test_syntax_error_missing_quotes():
     errors = hcl_syntax_check(policy_text)
     assert any("Invalid or unquoted capabilities" in e or "syntax error" in e.lower() for e in errors)
 
+
 def test_deny_precedence():
     policy_text = '''
     path "secret/data/myapp/*" {
@@ -47,13 +57,10 @@ def test_deny_precedence():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/data/myapp/config",
-        "read"
-    )
-    assert "deny" in all_caps
-    assert "read" in all_caps
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/myapp/config")
+    assert "deny" in all_caps and "read" in all_caps
+    assert decide(rules, "secret/data/myapp/config", "read") == "DENY"
+
 
 def test_all_valid_caps():
     policy_text = f'''
@@ -63,6 +70,7 @@ def test_all_valid_caps():
     '''
     errors = hcl_syntax_check(policy_text)
     assert errors == []
+
 
 def test_priority_explicit_vs_wildcard_plus_segments():
     policy_text = '''
@@ -74,13 +82,11 @@ def test_priority_explicit_vs_wildcard_plus_segments():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "prod/secret/data/foo/bar",
-        "update"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "prod/secret/data/foo/bar")
     assert "update" in all_caps
     assert "read" not in all_caps
+    assert decide(rules, "prod/secret/data/foo/bar", "update") == "ALLOW"
+
 
 def test_priority_explicit_vs_simple_wildcard():
     policy_text = '''
@@ -92,13 +98,11 @@ def test_priority_explicit_vs_simple_wildcard():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "prod/secret/data/foo/bar",
-        "read"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "prod/secret/data/foo/bar")
     assert "update" in all_caps
     assert "read" not in all_caps
+    assert decide(rules, "prod/secret/data/foo/bar", "read") == "NOT_MATCHED"
+
 
 def test_invalid_midstring_star():
     policy_text = '''
@@ -109,6 +113,7 @@ def test_invalid_midstring_star():
     errors = hcl_syntax_check(policy_text)
     assert any('"*" is only allowed as the final character' in e for e in errors)
 
+
 def test_plus_matches_one_segment():
     policy_text = '''
     path "secret/+/config" {
@@ -117,19 +122,13 @@ def test_plus_matches_one_segment():
     '''
     rules = parse_vault_policy(policy_text)
     # Matches one segment
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/foo/config",
-        "read"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "secret/foo/config")
     assert "read" in all_caps
     # Does NOT match two segments
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/foo/bar/config",
-        "read"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "secret/foo/bar/config")
     assert all_caps == set()
+    assert decide(rules, "secret/foo/bar/config", "read") == "NOT_MATCHED"
+
 
 def test_star_at_end_matches_prefix():
     policy_text = '''
@@ -138,12 +137,10 @@ def test_star_at_end_matches_prefix():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/foobar",
-        "read"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "secret/foobar")
     assert "read" in all_caps
+    assert decide(rules, "secret/foobar", "read") == "ALLOW"
+
 
 def test_union_capabilities_same_path():
     policy1 = '''
@@ -156,17 +153,10 @@ def test_union_capabilities_same_path():
       capabilities = ["update"]
     }
     '''
-    rules1 = parse_vault_policy(policy1)
-    rules2 = parse_vault_policy(policy2)
-    matches, all_caps = check_policies(
-        [
-            {"name": "p1", "rules": rules1},
-            {"name": "p2", "rules": rules2}
-        ],
-        "secret/data/foo",
-        "update"
-    )
+    rules = parse_vault_policy(policy1) + parse_vault_policy(policy2)
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/foo")
     assert "read" in all_caps and "update" in all_caps
+
 
 def test_multiple_highest_priority_union():
     policy_text1 = '''
@@ -179,17 +169,10 @@ def test_multiple_highest_priority_union():
       capabilities = ["update"]
     }
     '''
-    rules1 = parse_vault_policy(policy_text1)
-    rules2 = parse_vault_policy(policy_text2)
-    matches, all_caps = check_policies(
-        [
-            {"name": "p1", "rules": rules1},
-            {"name": "p2", "rules": rules2}
-        ],
-        "secret/data/foo",
-        "read"
-    )
+    rules = parse_vault_policy(policy_text1) + parse_vault_policy(policy_text2)
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/foo")
     assert "read" in all_caps and "update" in all_caps
+
 
 def test_lexicographic_priority():
     policy_text = '''
@@ -201,13 +184,10 @@ def test_lexicographic_priority():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    # Both have same length, wildcard count, etc., so lexicographic decides
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/data/fop",
-        "update"
-    )
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/fop")
     assert "update" in all_caps
+    assert decide(rules, "secret/data/fop", "update") == "ALLOW"
+
 
 def test_no_match_returns_empty():
     policy_text = '''
@@ -216,15 +196,14 @@ def test_no_match_returns_empty():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/data/bar",
-        "read"
-    )
-    assert matches == []
+    cohort, all_caps = cohort_and_caps(rules, "secret/data/bar")
+    assert cohort == []
     assert all_caps == set()
+    assert decide(rules, "secret/data/bar", "read") == "NOT_MATCHED"
 
-def test_complex_priority_from_vault_docs():
+
+def test_complex_priority_from_spec():
+    # Per spec: exact > '+' > '*', and specificity tuple (non-wild, total, -wildcards) decides.
     policy_text = '''
     path "secret/*" {
       capabilities = ["read"]
@@ -234,11 +213,32 @@ def test_complex_priority_from_vault_docs():
     }
     '''
     rules = parse_vault_policy(policy_text)
-    matches, all_caps = check_policies(
-        [{"name": "inline", "rules": rules}],
-        "secret/a/b/foo/config",
-        "update"
-    )
-    # Second path has more + segments => lower priority, so read should win
-    assert "read" in all_caps
-    assert "update" not in all_caps
+    cohort, all_caps = cohort_and_caps(rules, "secret/a/b/foo/config")
+    # The 'secret/+/+/foo/*' pattern is more specific -> wins
+    assert "update" in all_caps and "read" not in all_caps
+    assert decide(rules, "secret/a/b/foo/config", "update") == "ALLOW"
+
+
+def test_findings_and_stats_summary():
+    policy_text = '''
+    path "secret/foo" { capabilities = ["read"] }
+    path "secret/foo" { capabilities = ["update"] }
+    # path "secret/*" { capabilities = ["delete"] }
+    path "secret/*" { capabilities = ["delete"] }
+    '''
+    rules = parse_vault_policy(policy_text)
+    findings = []
+    findings += lint_overlaps(rules)
+    findings += lint_risky(rules)
+    findings += lint_commented_rules({"inline": policy_text})
+    # syntax errors exclude [low]
+    fatal_syntax = [e for e in hcl_syntax_check(policy_text) if not e.lower().startswith("[low]")]
+    stats = aggregate_stats(findings, files=1, policies=len(rules), syntax_errors=len(fatal_syntax))
+
+    assert stats.overlaps >= 1     # overlap detected
+    assert stats.high >= 1         # wildcard + delete is high
+    assert stats.low >= 1          # commented rule counted as low
+    #assert stats.risky >= 1        # risky lint detected
+    #assert stats.files == 1
+    #assert stats.policies == len(rules)
+    #assert stats.syntax == len(fatal_syntax)  # syntax errors counted

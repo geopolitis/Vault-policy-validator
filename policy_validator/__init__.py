@@ -1,25 +1,29 @@
-"""
-policy_validator package
-
-Tools for validating Vault HCL policies, checking capabilities,
-and detecting risky or overlapping ACLs.
-"""
-
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Literal, Set
 
-# Re-export main public API
-from .parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy, VALID_CAPS
-from .priority import check_policies
-from .lints import find_overlapping_acls, suggest_optimizations, risky_grants_lint
+@dataclass(frozen=True)
+class Rule:
+    path: str
+    capabilities: Set[str]
+    source: str
+    lineno: int
 
+@dataclass(frozen=True)
+class Finding:
+    severity: Literal["high", "risky", "low"]
+    code: str
+    message: str
+    path: str | None = None
+    source: str | None = None
+    lineno: int | None = None
 
-__all__ = [
-    "CAPABILITIES",
-    "VALID_CAPS",
-    "hcl_syntax_check",
-    "parse_vault_policy",
-    "check_policies",
-    "find_overlapping_acls",
-    "suggest_optimizations",
-    "risky_grants_lint",
-]
+@dataclass(frozen=True)
+class Stats:
+    files: int = 0
+    policies: int = 0
+    syntax: int = 0
+    overlaps: int = 0
+    high: int = 0
+    low: int = 0
+    risky: int = 0

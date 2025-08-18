@@ -1,169 +1,218 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
 import streamlit as st
-
-# Prefer package imports; fall back to local modules when running from repo root
 try:
-    from policy_validator.parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
-    from policy_validator.priority import check_policies
-    from policy_validator.lints import (
-        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
-        risk_counts, filter_by_severity,
-    )
+    from .parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
+    from .priority import cohort_and_caps, decide
+    from .lints import lint_overlaps, lint_risky, lint_commented_rules, aggregate_stats
+    from . import Rule, Finding, Stats
 except Exception:
-    from parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy  # type: ignore
-    from priority import check_policies  # type: ignore
-    from lints import (  # type: ignore
-        find_overlapping_acls, suggest_optimizations, risky_grants_lint,
-        risk_counts, filter_by_severity,
-    )
+    import sys, pathlib
+    ROOT = pathlib.Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(ROOT))
+    from policy_validator.parser import CAPABILITIES, hcl_syntax_check, parse_vault_policy
+    from policy_validator.priority import cohort_and_caps, decide
+    from policy_validator.lints import lint_overlaps, lint_risky, lint_commented_rules, aggregate_stats
+    from policy_validator import Rule, Finding, Stats
 
-st.set_page_config(page_title="Vault Policy Checker", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vault Policy Validator", layout="wide", initial_sidebar_state="expanded")
+
+def _split_errors(errors: List[str]) -> Tuple[List[str], List[str]]:
+    """Return (fatal_errors, low_warnings)."""
+    fat: List[str] = []
+    low: List[str] = []
+    for e in errors:
+        (low if e.strip().lower().startswith("[low]") else fat).append(e)
+    return fat, low
+
+def _analyze_text(text: str, source: str) -> tuple[list[str], list[Rule], list[Finding]]:
+    """Parse & lint. Never block; best-effort parsing always runs."""
+    text = text or ""
+    errs = hcl_syntax_check(text) if text.strip() else []
+    rules = parse_vault_policy(text, source=source) if text.strip() else []
+    finds: List[Finding] = []
+    finds += lint_overlaps(rules)
+    finds += lint_risky(rules)
+    finds += lint_commented_rules({source: text})
+    return errs, rules, finds
+
+def _render_stats(stats: Stats) -> None:
+    st.sidebar.markdown("### Statistics")
+    st.sidebar.write(f"- Files searched: {stats.files}")
+    st.sidebar.write(f"- Policies parsed: {stats.policies}")
+    st.sidebar.write(f"- Syntax errors: {stats.syntax}")
+    st.sidebar.write(f"- Overlapping ACL paths: {stats.overlaps}")
+    st.sidebar.write(f"- High risk findings: {stats.high}")
+    st.sidebar.write(f"- Low risk findings: {stats.low}")
+    st.sidebar.write(f"- Risky findings: {stats.risky}")
+
+def _render_findings(findings: List[Finding], severity_filter: str) -> None:
+    if not findings:
+        return
+    visible = findings if severity_filter == "all" else [f for f in findings if f.severity == severity_filter]
+    for f in visible:
+        tag = f"[{f.severity}]"
+        loc = f" ({f.source}:{f.lineno})" if f.source and f.lineno else ""
+        msg = f"{tag} {f.code}: {f.message}{loc}"
+        if f.severity == "high":
+            st.error(msg)
+        elif f.severity == "risky":
+            st.warning(msg)
+        else:
+            st.info(msg)
+
+# ---------------- sidebar ----------------
 
 st.sidebar.title("Vault Policy Checker")
-mode = st.sidebar.radio("Mode", ["Single file", "Scan folder"])
-severity = st.sidebar.selectbox("Filter by severity", ["all", "high", "low", "syntax", "risky"], index=0)
+mode = st.sidebar.radio("Mode", ["Single file", "Scan folder"], index=0)
+severity = st.sidebar.selectbox("Severity", ["all", "high", "risky", "low"], index=0)
+st.sidebar.markdown("---")
 
-# Request
-request_path = st.sidebar.text_input("Request Path (e.g., secret/data/foo/bar)", value="")
-operation = st.sidebar.selectbox("Operation / Capability", CAPABILITIES)
+# File actions are in the SIDEBAR now
+if mode == "Single file":
+    source = st.sidebar.radio("Source", ["Upload file", "Paste text"], index=1, key="source_choice")
+    if source == "Upload file":
+        uploaded = st.sidebar.file_uploader("Upload .hcl / .policy / .txt", type=["hcl", "policy", "txt"], key="uploader")
+        load_clicked = st.sidebar.button("Load file", use_container_width=True)
+        if uploaded and load_clicked:
+            st.session_state["policy_text"] = uploaded.read().decode("utf-8", errors="replace")
+else:
+    st.sidebar.text("Folder scan")
+    folder = st.sidebar.text_input("Folder path (server-side)", value=st.session_state.get("scan_folder", ""))
+    st.session_state["scan_folder"] = folder
+    exts = st.sidebar.text_input("Extensions (comma separated)", value=st.session_state.get("scan_exts", ".hcl,.policy,.txt"))
+    st.session_state["scan_exts"] = exts
+    scan_clicked = st.sidebar.button("Scan folder", use_container_width=True)
+
+st.sidebar.markdown("---")
+
+# Stats placeholder at first load
+if "stats" not in st.session_state:
+    st.session_state["stats"] = Stats()
+_render_stats(st.session_state["stats"])
+
+# ---------------- main page ----------------
+
+st.header("Vault Policy Validation, Linting, and Analysis")
+
+# MOVE Request Path & Capability to MAIN (not sidebar)
+c1, c2 = st.columns([2, 1])
+with c1:
+    req_path = st.text_input("Request Path", value=st.session_state.get("req_path", ""), placeholder="e.g., secret/data/foo/bar")
+    st.session_state["req_path"] = req_path
+with c2:
+    capability = st.selectbox("Capability", CAPABILITIES, index=0, key="capability_select")
 
 if mode == "Single file":
-    use_paste = st.sidebar.checkbox("Paste text instead of uploading", value=True)
-    if use_paste:
-        policy_text = st.text_area("Paste Vault policy blocks here", value="", height=320)
-        check_clicked = st.button("Check Policy")
-        if check_clicked:
-            hcl_errors = hcl_syntax_check(policy_text) if policy_text.strip() else []
-            rules = parse_vault_policy(policy_text) if not hcl_errors else []
-            overlaps = find_overlapping_acls(rules) if rules else {}
-            risky_msgs = risky_grants_lint(rules) if rules else []
-    else:
-        uploaded = st.sidebar.file_uploader("Upload policy (.hcl, .txt)", type=["hcl", "txt"])
-        loaded = st.sidebar.button("Load File")
-        policy_text = uploaded.read().decode("utf-8", errors="replace") if (uploaded and loaded) else ""
-        hcl_errors = hcl_syntax_check(policy_text) if policy_text.strip() else []
-        rules = parse_vault_policy(policy_text) if not hcl_errors else []
-        overlaps = find_overlapping_acls(rules) if rules else {}
-        risky_msgs = risky_grants_lint(rules) if rules else []
+    st.subheader("Single File")
+    # Big editor always on main; pre-populated when user loads file from sidebar
+    policy_text = st.text_area(
+        "Policy (paste or edit here)",
+        value=st.session_state.get("policy_text", ""),
+        height=360,
+        placeholder='path "kv/data/foo/*" { capabilities = ["read","list"] }',
+        key="policy_editor",
+    )
 
-    stats = {
-        "files": 1 if (policy_text.strip()) else 0,
-        "policies": len(rules) if 'rules' in locals() else 0,
-        "syntax": len(hcl_errors) if 'hcl_errors' in locals() else 0,
-        "overlaps": len(overlaps) if 'overlaps' in locals() else 0,
-        **(risk_counts(risky_msgs) if 'risky_msgs' in locals() else {"high":0,"low":0,"risky":0}),
-    }
-    with st.sidebar:
-        st.markdown("### Statistics")
-        st.write(f"- Files searched: {stats.get('files', 0)}")
-        st.write(f"- Policies parsed: {stats.get('policies', 0)}")
-        st.write(f"- Syntax errors: {stats.get('syntax', 0)}")
-        st.write(f"- Overlapping ACL paths: {stats.get('overlaps', 0)}")
-        st.write(f"- High risk findings: {stats.get('high', 0)}")
-        st.write(f"- Low risk findings: {stats.get('low', 0)}")
-        st.write(f"- Risky findings: {stats.get('risky', 0)}")
+    analyze_clicked = st.button("Analyze", type="primary")
 
-    st.subheader("Results")
-    if 'hcl_errors' in locals() and hcl_errors:
-        st.error("HCL Syntax Error(s):")
-        for m in filter_by_severity(hcl_errors, severity):
-            st.write(f"- {m}")
+    if analyze_clicked:
+        errs, rules, findings = _analyze_text(policy_text, source="inline")
+        fatal, _ = _split_errors(errs)
+        stats = aggregate_stats(findings, files=1, policies=len(rules), syntax_errors=len(fatal))
+        st.session_state["stats"] = stats
+        _render_stats(stats)
 
-    if 'rules' in locals() and rules:
-        if overlaps:
-            st.warning("Overlapping ACL paths detected:")
-            for p, rs in overlaps.items():
-                st.write(f"- `{p}` appears in {len(rs)} rules")
-            for s in suggest_optimizations(overlaps):
-                st.info(f"- {s}")
-        for m in filter_by_severity(risky_msgs, severity):
-            (st.error if "[high]" in m.lower() else st.warning)(m)
+        st.subheader("Syntax")
+        if errs:
+            for e in errs:
+                (st.error if not e.lower().startswith("[low]") else st.warning)(e)
+        else:
+            st.success("No syntax errors detected.")
 
-        if st.button("Check Permission"):
-            matches, all_caps = check_policies([{"name": "inline", "rules": rules}], request_path, operation)
-            if not matches:
-                st.error("No matching rules found for this path.")
-            else:
-                if "deny" in all_caps:
-                    st.error("Permission DENIED due to explicit `deny` on the highest-priority match.")
-                elif operation in all_caps:
-                    st.success("Permission GRANTED by the highest-priority match.")
-                else:
-                    st.warning("Operation not explicitly granted by the highest-priority match.")
-                with st.expander("Matched rules (by priority)"):
-                    for _, r in matches:
-                        st.write(f"- `{r['path']}` → caps: {sorted(r.get('capabilities', []))}")
+        st.subheader("Findings")
+        _render_findings(findings, severity)
+
+        st.subheader("Decision")
+        if req_path and st.session_state.get("capability_select"):
+            cohort, caps = cohort_and_caps(rules, req_path)
+            result = decide(rules, req_path, st.session_state["capability_select"])
+            st.write(f"Decision: **{result}**")
+            if cohort:
+                with st.expander("Matched rules (highest specificity)"):
+                    for r in cohort:
+                        st.write(f"- `{r.path}` from **{r.source}** @ line {r.lineno} → {sorted(r.capabilities)}")
+                st.caption(f"Effective caps on best path: `{', '.join(sorted(caps))}`")
+        else:
+            st.info("Enter a Path and Capability to test a decision.")
 
 else:
-    from pathlib import Path
-    import os
-    folder = st.sidebar.text_input("Folder path (server-side)", value="")
-    exts = st.sidebar.text_input("Include extensions (comma-separated)", value=".hcl,.txt,.policy")
-    do_scan = st.sidebar.button("Scan folder")
+    st.subheader("Scan Folder")
+    if "scan_results" not in st.session_state:
+        st.session_state["scan_results"] = None
 
-    total_files = total_policies = total_syntax = 0
-    total_overlaps: Dict[str, Any] = {}
-    total_risk = {"high":0,"low":0,"risky":0}
+    if 'scan_clicked_flag' not in st.session_state:
+        st.session_state['scan_clicked_flag'] = False
 
-    if do_scan and folder.strip():
-        folder_path = Path(folder)
-        if not folder_path.exists() or not folder_path.is_dir():
-            st.error("Folder not found or not a directory.")
-        else:
-            include_exts = {e.strip().lower() for e in exts.split(",") if e.strip()}
-            files: List[Path] = []
-            for root, _, filenames in os.walk(folder_path):
-                for fn in filenames:
+    # If user pressed the sidebar button this run
+    if 'scan_clicked' in locals() and scan_clicked:
+        st.session_state['scan_clicked_flag'] = True
+
+    if st.session_state['scan_clicked_flag']:
+        base = Path(st.session_state.get("scan_folder") or "")
+        include_exts = {e.strip().lower() for e in (st.session_state.get("scan_exts") or "").split(",") if e.strip()}
+
+        texts: Dict[str, str] = {}
+        all_errs: List[str] = []
+        all_rules: List[Rule] = []
+        all_findings: List[Finding] = []
+
+        files: List[Path] = []
+        if base.exists() and base.is_dir():
+            for root, _, names in os.walk(base):
+                for fn in names:
                     p = Path(root) / fn
                     if p.suffix.lower() in include_exts:
                         files.append(p)
+        else:
+            st.error("Folder not found or not a directory.")
 
-            total_files = len(files)
-            st.subheader(f"Scan Results — {total_files} file(s)")
-            for fp in files:
-                try:
-                    text = fp.read_text(encoding="utf-8", errors="replace")
-                except Exception as e:
-                    st.error(f"Syntax: Error reading {fp}: {e}")
-                    continue
+        for fp in files:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+            errs, rules, findings = _analyze_text(text, source=str(fp))
+            texts[str(fp)] = text
+            all_errs += errs
+            all_rules += rules
+            all_findings += findings
 
-                hcl_errs = hcl_syntax_check(text)
-                rules = parse_vault_policy(text) if not hcl_errs else []
-                ovs = find_overlapping_acls(rules) if rules else {}
-                risks = risky_grants_lint(rules) if rules else []
+        fatal = [e for e in all_errs if not e.lower().startswith("[low]")]
+        stats = aggregate_stats(all_findings, files=len(files), policies=len(all_rules), syntax_errors=len(fatal))
+        st.session_state["stats"] = stats
+        _render_stats(stats)
 
-                total_policies += len(rules)
-                total_syntax += len(hcl_errs)
-                for k, v in ovs.items():
-                    total_overlaps.setdefault(k, []).extend(v)
-                rc = risk_counts(risks)
-                for k in ("high","low","risky"):
-                    total_risk[k] += rc[k]
+        st.subheader("Syntax")
+        if all_errs:
+            for e in all_errs:
+                (st.error if not e.lower().startswith("[low]") else st.warning)(e)
+        else:
+            st.success("No syntax errors detected.")
 
-                with st.expander(f"{fp}"):
-                    if hcl_errs:
-                        st.error("Syntax Errors:")
-                        for m in filter_by_severity(hcl_errs, severity):
-                            st.write(f"- {m}")
-                    if rules:
-                        if ovs:
-                            st.warning("Overlaps:")
-                            for pth, rs in ovs.items():
-                                st.write(f"- `{pth}` appears in {len(rs)} rules")
-                            for s in suggest_optimizations(ovs):
-                                st.info(f"- {s}")
-                        for m in filter_by_severity(risks, severity):
-                            (st.error if "[high]" in m.lower() else st.warning)(m)
+        st.subheader("Findings")
+        _render_findings(all_findings, severity)
 
-    stats = {"files": total_files, "policies": total_policies, "syntax": total_syntax,
-             "overlaps": len(total_overlaps), **total_risk}
-    with st.sidebar:
-        st.markdown("### Statistics")
-        st.write(f"- Files searched: {stats.get('files', 0)}")
-        st.write(f"- Policies parsed: {stats.get('policies', 0)}")
-        st.write(f"- Syntax errors: {stats.get('syntax', 0)}")
-        st.write(f"- Overlapping ACL paths: {stats.get('overlaps', 0)}")
-        st.write(f"- High risk findings: {stats.get('high', 0)}")
-        st.write(f"- Low risk findings: {stats.get('low', 0)}")
-        st.write(f"- Risky findings: {stats.get('risky', 0)}")
+        st.subheader("Decision Across Folder")
+        if req_path and st.session_state.get("capability_select"):
+            cohort, caps = cohort_and_caps(all_rules, req_path)
+            result = decide(all_rules, req_path, st.session_state["capability_select"])
+            st.write(f"Decision: **{result}**")
+            if cohort:
+                with st.expander("Matched rules (highest specificity)"):
+                    for r in cohort:
+                        st.write(f"- `{r.path}` from **{r.source}** @ line {r.lineno} → {sorted(r.capabilities)}")
+                st.caption(f"Effective caps on best path: `{', '.join(sorted(caps))}`")
+        else:
+            st.info("Enter a Path and Capability to test a decision.")
+    else:
+        st.info("Set folder & extensions in the sidebar, then click **Scan folder**.")

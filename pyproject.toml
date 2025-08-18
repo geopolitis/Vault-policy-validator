@@ -7,7 +7,7 @@ policy-validator = "policy_validator.cli:main"
 
 [project]
 name = "policy_validator"
-version = "0.1.12"
+version = "0.1.17"
 description = "Vault policy validation tool with priority rules, lints, and Streamlit UI."
 authors = [
     { name = "George Politis" }

@@ -1,211 +1,274 @@
-# Vault Policy Validator (Streamlit + CLI)
+# Vault Policy Validator
 
-A fast, lightweight validator for **HashiCorp Vault** policies. It parses HCL-like policy blocks, checks for common mistakes, flags risky grants, and evaluates whether a given **request path + capability** would be allowed by the **highest-priority** matching rule. Comes with both a Streamlit UI and a CLI to use with CI/CD pipelines, plus pytest tests.
+Validate, lint, and analyze **Vault HCL policies**. Ships with a **CLI** and a **UI**.
+Parses best-effort (never blocks), reports all findings, and evaluates permissions with Vault-style precedence.
 
----
+## Features
 
-## ✨ Features
+* **HCL parsing & syntax checks**
 
-- **Two UIs**  
-  - **Streamlit app**: paste/upload a policy or scan a folder; interactive results.  
-  - **CLI**: validate files/folders; run permission checks; JSON output.
+  * Balanced braces/brackets/quotes
+  * `capabilities = [...]` must be **quoted** and **valid**
+  * Unknown keys flagged as `[low]`
+  * Commented-out rules detected as `[low]`
 
-- **Policy parsing (HCL-like)**  
-  - Supports both `path("pattern") { ... }` and `path "pattern" { ... }`.  
-  - Detects **unquoted** capabilities in lists (e.g. `[read, list]`).  
-  - Flags unmatched braces and quotes; strips `#`-prefixed full-line comments.
+* **Decision engine**
 
-- **Risk & quality checks**
-  - Overlapping ACL paths.  
-  - Risky wildcard usage (e.g., wildcard + `update`/`delete`/`sudo`).  
-  - Suggestions to merge identical rules.
+  * Exact literal > `+` (one segment) > `*` (suffix)
+  * Trailing `*` inside segment (e.g. `foo*`) = segment prefix
+  * Most-specific cohort wins; `deny` on the best cohort overrides
+  * `ALLOW | DENY | NOT_MATCHED`
 
-- **Priority evaluation**
-  - Finds **all** matching rules and sorts by priority.  
-  - **Exact** paths outrank wildcards.  
-  - Longer literal prefix outranks shorter (`*`/`+` appear later).  
-  - Fewer `+` segments outrank more `+`.  
-  - Same-best-path rules from multiple policies are **unioned**.
+* **Linting**
 
-- **Test suite** (pytest) and optional **coverage** (pytest-cov).
+  * Overlaps: identical literal paths in multiple rules (suggest merge)
+  * Wildcard + high-risk capabilities (default: `delete, sudo, update, patch, revoke`)
+  * Commented-out “rules”
 
----
+* **Consistent Stats (CLI & UI)**
 
-## 📦 Requirements
+  * Files searched, policies parsed, syntax errors, overlaps, high/low/risky counts
 
-- Python **3.11+**  
-- Pip + virtualenv recommended
+* **Output**
 
----
-
-## 🚀 Installation
-
-From the repository root (the folder that contains `pyproject.toml`):
-
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-python -m pip install --upgrade pip
-
-# Editable install (recommended for development)
-python -m pip install -e .
-```
-
-If you don’t want to install, you can still run the UI via Streamlit and the tests via a tiny `tests/conftest.py` shim (see below), but editable install is the simplest.
+  * Human-readable
+  * JSON schema for automation
+  * Severity filtering: `all | high | risky | low`
 
 ---
 
-## 🖥️ Streamlit App
-
-Run the app from the repo root:
-
-```bash
-streamlit run main.py
-# (you can also run `ui.py`, but `main.py` is the consolidated app)
-```
-
-### Sidebar (order & actions)
-1. **Mode**: `Single file` or `Scan folder`  
-2. **Load policy**: `Upload file` (+ **Load File** button) or `Paste text` (use the big editor + **Check Policy**)  
-3. **Request**: Request **Path** and desired **Capability**  
-4. **Filter**: Filter results by severity (`all`, `high`, `low`, `syntax`, `risky`)  
-5. **Statistics**: Files searched, policies parsed, syntax errors, overlaps, high/low/risky counts
-
-### Main pane
-- **Paste / Upload**: shows parsed rules, syntax errors, overlaps, and risk findings.  
-- **Check Permission**: evaluates your selected request path + capability against the **highest-priority** matching path and explains the result (GRANTED / DENIED / not explicitly granted).  
-- **Scan folder**: recursively walks the folder, filters by extensions (default: `.hcl,.txt,.policy`), aggregates stats, and shows per-file results.
-
----
-
-## 🧰 CLI
-
-Run the CLI without installing (local modules) or via the installed package.
-
-**Local (repo root):**
-```bash
-python -m policy_validator.cli <path> [--severity all|high|low|syntax|risky] \
-  [--exts .hcl,.txt,.policy] \
-  [--check-path secret/data/foo --cap read] \
-  [--show-matches] [--json]
-```
-
-**Examples**
-```bash
-# Validate one file
-python -m policy_validator.cli ./examples/example.hcl --severity all
-
-# Check a permission against that file
-python -m policy_validator.cli ./examples/example.hcl \
-  --check-path secret/data/myapp/config --cap read --show-matches
-
-# Scan a folder and summarize
-python -m policy_validator.cli ./policies --exts .hcl,.policy --json
-```
-
-**Exit codes**
-- `0`: permission GRANTED  
-- `2`: DENIED (explicit `deny` on the best path)  
-- `3`: not explicitly granted  
-- `1`: error (missing inputs / no policies)
-
----
-
-## 🧩 Policy format & rules
-
-- **Blocks**
-  ```hcl
-  path "kv/data/foo/*" { capabilities = ["read", "list"] }
-  path("kv/data/bar")  { capabilities = "update" }
-  ```
-- **Capabilities** must be quoted in lists. The validator flags unquoted tokens:
-  ```hcl
-  capabilities = [read, list]   # ❌ will raise: Invalid or unquoted capabilities
-  ```
-- **Allowed capabilities** (extendable):  
-  `create, read, update, patch, delete, list, sudo, deny, subscribe, recover`
-
-- **Comments**: lines starting with `#` are ignored.
-
-- **Wildcards**
-  - `*` is a **suffix** wildcard and **only allowed at the end** of the path.  
-    `path "secret/*/data"` → ❌ flagged as invalid.  
-  - `+` matches a **single path segment** (e.g., `secret/+/data` matches `secret/app/data`).
-
-- **Priority** (best match wins; caps are **unioned** across policies that match the **exact same best path**)
-  1. Longer literal prefix (first wildcard appears **later**) is higher priority  
-  2. Exact path (no `+` or `*`) outranks wildcard  
-  3. Fewer `+` segments outrank more `+`  
-  4. Longer path wins; then lexicographic tie-break
-
----
-
-## 🧪 Tests
-
-Install pytest (and optionally pytest-cov):
-
-```bash
-pip install -e .
-pip install pytest pytest-cov
-```
-
-Run tests from the **repo root**:
-
-```bash
-pytest -q
-```
-
-### Coverage
-```bash
-pytest --cov=policy_validator --cov-report=term-missing --cov-branch
-# or (if your modules live at root)
-# pytest --cov=. --cov-report=term-missing --cov-branch
-```
-
-You can also configure defaults in `pyproject.toml`:
-
-```toml
-[tool.pytest.ini_options]
-addopts = "-q --cov=policy_validator --cov-report=term-missing --cov-branch"
-testpaths = ["tests"]
-
-[tool.coverage.run]
-source = ["policy_validator"]
-branch = true
-omit = ["policy_validator/main.py", "policy_validator/ui.py"]  # optional
-
-[tool.coverage.report]
-show_missing = true
-skip_covered = true
-```
-
-> If you want to run tests **without** installing the package, add this minimal `tests/conftest.py` so imports resolve:
-> ```python
-> import sys, pathlib
-> sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-> ```
-
----
-
-## 🗂️ Project layout (key files)
+## Project Layout
 
 ```
 policy_validator/
-├── __init__.py          # package facade/re-exports
-├── matcher.py           # path matching (+ for one segment, * suffix)
-├── priority.py          # comparator + check_policies()
-├── parser.py            # HCL-like parsing & syntax checks
-├── lints.py             # overlaps, risky grants, tiny helpers
-├── main.py              # Streamlit app (consolidated)
-├── ui.py                # Alternate Streamlit UI
-├── cli.py               # CLI entry-point
-└── tests/               # pytest tests (if present)
+  __init__.py          # dataclasses: Rule, Finding, Stats (no imports here)
+  parser.py            # HCL parsing + syntax validation
+  matcher.py           # path matching and specificity
+  priority.py          # precedence & decision (“decide”, “cohort_and_caps”)
+  lints.py             # structured linters + stats aggregator
+  cli.py               # argparse CLI
+  ui.py                # Streamlit UI
+tests/
+  test_policy_validator.py
+pyproject.toml
+.coveragerc
+pytest.ini
+README.md
 ```
 
 ---
 
-## ⚠️ Limitations
+## Install
 
-- The parser is **lightweight** and not a full HCL parser. It focuses on Vault policy patterns and common issues.
-- Only `capabilities` are evaluated; advanced attributes (e.g., `control_group`) are currently ignored.
-- `*` wildcard is validated as **suffix-only** by design (matches the app’s tests and lint rules).
+Requires **Python 3.11+**.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+If you’re only running the CLI:
+
+```bash
+python -m pip install -e ".[cli]"
+```
+
+(Or just keep the editable install; dependencies are light.)
+
+---
+
+## Run the UI
+
+```bash
+streamlit run policy_validator/ui.py
+```
+
+* **Sidebar**: choose *Single file* or *Scan folder*, set **Severity** filter, upload/scan from the sidebar, live **Statistics**.
+* **Main**: set **Request Path** and **Capability**, paste/edit policy text, view **Syntax**, **Findings**, and **Decision**.
+* “Matched rules (highest specificity)” shows the winning cohort and effective capabilities.
+
+> Tip: If you ever see “attempted relative import” from Streamlit, you’re probably running from a non-package context. This repo includes an **import shim** in `ui.py` that handles both `streamlit run policy_validator/ui.py` and module mode.
+
+---
+
+## Run the CLI
+
+### Basic
+
+```bash
+python -m policy_validator.cli --file policy.hcl --path secret/data/foo --cap read
+```
+
+### Folder scan
+
+```bash
+python -m policy_validator.cli --scan-folder ./policies --exts ".hcl,.policy,.txt" \
+  --path prod/secret/data/foo/bar --cap update
+```
+
+### Severity filter
+
+```bash
+python -m policy_validator.cli --file policy.hcl --severity risky
+```
+
+### JSON output
+
+```bash
+python -m policy_validator.cli --file policy.hcl --json > report.json
+```
+
+#### Sample human output
+
+```
+Statistics
+- files: 1
+- policies: 6
+- syntax: 0
+- overlaps: 2
+- high: 1
+- low: 2
+- risky: 0
+
+Syntax messages:
+- [low] Commented-out rules detected (lines starting with #). Consider removing them.
+
+Findings (severity=all):
+- [low] OVERLAP: secret/data/foo appears in 2 rules. Suggestion: merge rules for path secret/data/foo.
+- [high] WILDCARD_DELETE: Wildcard path 'secret/*' grants high-risk capabilities ['delete'].
+
+Decision: ALLOW
+
+Matched rules (highest specificity):
+- policy.hcl:42  path "secret/data/foo" -> ['read', 'update']
+Effective caps on best path: ['read', 'update']
+```
+
+#### JSON shape (simplified)
+
+```json
+{
+  "severity": "all",
+  "stats": { "files": 1, "policies": 6, "syntax": 0, "overlaps": 2, "high": 1, "low": 2, "risky": 0 },
+  "syntax": ["..."],
+  "findings": [
+    {"severity":"low","code":"OVERLAP","message":"...","path":"secret/data/foo","source":null,"lineno":null}
+  ],
+  "findings_visible": [ /* filtered by --severity */ ],
+  "decision": {
+    "path": "secret/data/foo",
+    "capability": "read",
+    "result": "ALLOW",
+    "cohort": [
+      {"path":"secret/data/foo","capabilities":["read","update"],"source":"policy.hcl","lineno":42}
+    ],
+    "caps": ["read","update"]
+  }
+}
+```
+
+**Exit codes**: `0` success; `2` if **syntax errors** (non-low) are present.
+
+---
+
+## Policy Semantics
+
+### Supported Capabilities (strict)
+
+```
+create, read, update, patch, delete, list, sudo, deny, subscribe, revoke
+```
+
+Unknown capabilities → **syntax/validation error**.
+
+### Wildcards
+
+* `+` matches **exactly one** segment: `kv/+/data` matches `kv/app/data`, not `kv/app/x/data`.
+* Final segment `*` matches **any suffix**: `secret/foo/*` matches `secret/foo` and deeper.
+* Trailing star inside a segment: `secret/foo*` matches `secret/foobar`.
+
+### Precedence (specificity)
+
+Higher is better:
+
+1. number of **non-wildcard** segments
+2. **total** segments
+3. **fewer** wildcards (`+`, `*`, `foo*`)
+
+On the **best cohort**:
+
+* If **any** rule has `deny` → **DENY**
+* Else union capabilities → **ALLOW** if requested capability present
+* Otherwise **NOT\_MATCHED**
+
+---
+
+## Linting Rules
+
+* **OVERLAP (low)**: same literal path appears in multiple rules. Suggests merging.
+* \**WILDCARD\_* (high)\*\*: wildcard path combined with **high-risk** capability (`delete, sudo, update, patch, revoke`).
+* **COMMENTED\_RULE (low)**: lines starting with `#` that look like path/capabilities.
+
+---
+
+## Development
+
+### Tests & Coverage
+
+```bash
+pytest -v
+# or with coverage
+pytest --cov=policy_validator --cov-report=term-missing
+```
+
+Coverage thresholds are configured in `pyproject.toml` / `.coveragerc`.
+CLI/UI are omitted from coverage by default (adjust `.coveragerc` if you want them included).
+
+### Static typing
+
+```bash
+mypy policy_validator
+```
+
+> If mypy flags local variables needing annotations, follow the pattern:
+> `var: list[str] = []`
+
+---
+
+## API Overview (for library use)
+
+```python
+from policy_validator.parser import parse_vault_policy, hcl_syntax_check, CAPABILITIES, VALID_CAPS
+from policy_validator.priority import decide, cohort_and_caps
+from policy_validator.lints import lint_overlaps, lint_risky, lint_commented_rules, aggregate_stats
+
+text = 'path "secret/*" { capabilities = ["read"] }'
+errors = hcl_syntax_check(text)               # list[str]
+rules  = parse_vault_policy(text, source="inline")
+
+cohort, caps = cohort_and_caps(rules, "secret/foo")
+decision     = decide(rules, "secret/foo", "read")  # "ALLOW" | "DENY" | "NOT_MATCHED"
+
+findings = []
+findings += lint_overlaps(rules)
+findings += lint_risky(rules)
+findings += lint_commented_rules({"inline": text})
+
+stats = aggregate_stats(findings, files=1, policies=len(rules), syntax_errors=len([e for e in errors if not e.lower().startswith("[low]")]))
+```
+
+---
+
+## Troubleshooting
+
+* **“attempted relative import with no known parent package”**
+  Use `streamlit run policy_validator/ui.py` or `python -m policy_validator.cli`. Import shims in UI/CLI handle both modes.
+
+* **UI shows syntax warnings and stops**
+  This app is **non-blocking**: parsing, linting, and decisions always run. If you see stalls, ensure you’re on the current `ui.py`.
+
+* **Coverage under threshold**
+  By default we omit UI/CLI in `.coveragerc`. Include them or add tests if you prefer counting them.
+

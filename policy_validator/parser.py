@@ -1,152 +1,141 @@
-# parser.py
 from __future__ import annotations
-
 import re
-from typing import List, Optional, Tuple, Dict, Any, Set
+from dataclasses import dataclass
+from typing import List, Set, Tuple
+from . import Rule
 
-# Allowed capabilities (extend as needed)
+# Strict capability catalog
 CAPABILITIES: List[str] = [
     "create", "read", "update", "patch", "delete",
-    "list", "sudo", "deny", "subscribe", "recover",
+    "list", "sudo", "deny", "subscribe", "revoke",
 ]
 VALID_CAPS: Set[str] = set(CAPABILITIES)
 
-# Support BOTH syntaxes:
-#   1) path("pattern") { ... }
-#   2) path "pattern" { ... }
-PATH_BLOCK_PAREN_RE = re.compile(r'path\s*\(\s*"([^"]+)"\s*\)\s*\{(.*?)\}', re.DOTALL)
-PATH_BLOCK_LABEL_RE = re.compile(r'path\s*"([^"]+)"\s*\{(.*?)\}', re.DOTALL)
+# Regex for both syntaxes:
+#   path "pattern" { ... }
+#   path("pattern") { ... }
+_PATH_BLOCKS = re.compile(
+    r'(?P<full>path\s*(?:\(\s*"(?P<pat1>[^"]+)"\s*\)|"(?P<pat2>[^"]+)")\s*\{(?P<body>.*?)\})',
+    re.DOTALL | re.IGNORECASE
+)
+_CAPS = re.compile(r'\bcapabilities\b\s*=\s*(\[[^\]]*\]|"[^"]+"|\w+)', re.DOTALL | re.IGNORECASE)
+# any k = v pairs inside body for unknown key warnings
+_KEY_ASSIGN = re.compile(r'^\s*([A-Za-z_]\w*)\s*=', re.MULTILINE)
 
-# Capabilities can be:
-#   - list:    capabilities = ["read", "list"]
-#   - string:  capabilities = "read"
-#   - bareword capabilities = read
-CAPS_RE = re.compile(r'\bcapabilities\b\s*=\s*(\[[^\]]*\]|"[^"]+"|\w+)', re.DOTALL)
+def _lineno(src: str, start_idx: int) -> int:
+    return src.count("\n", 0, start_idx) + 1
 
-def _normalize_caps_value(raw: str, path: str) -> Tuple[Optional[List[str]], Optional[str]]:
+def _strip_inline_comments(src: str) -> str:
+    # We only ignore full-line comments via lints; inline are kept for simplicity
+    return src
+
+def _barewords_inside_list(list_text: str) -> List[str]:
+    inner = list_text.strip()[1:-1]  # remove [ ]
+    # Remove quoted strings, then find identifiers
+    inner_no_quotes = re.sub(r'"[^"]*"', "", inner)
+    return re.findall(r'[A-Za-z_][A-Za-z0-9_]*', inner_no_quotes)
+
+def hcl_syntax_check(text: str) -> List[str]:
     """
-    Convert the raw capabilities value (matched as a string) into a validated list[str].
-    Supports list syntax, quoted string, or bareword.
+    Validate structure & capability tokens. Returns list of error/warning messages.
+    Never raises; callers may still proceed to parse.
     """
-    raw = raw.strip()
+    text = _strip_inline_comments(text or "")
+    msgs: List[str] = []
 
-    # Parse list of quoted strings: ["read","list"]
-    if raw.startswith("[") and raw.endswith("]"):
-        # Extract quoted items robustly (avoid naive split on commas)
-        items = re.findall(r'"([^"]+)"', raw)
-        caps_list = [i.strip() for i in items]
-    # Parse single quoted string: "read"
-    elif raw.startswith('"') and raw.endswith('"'):
-        caps_list = [raw[1:-1].strip()]
-    else:
-        # bareword: read
-        caps_list = [raw]
+    if text.count("{") != text.count("}"):
+        msgs.append("Unmatched curly brace ({ or }).")
+    if text.count("[") != text.count("]"):
+        msgs.append("Unmatched bracket ([ or ]).")
+    if text.count('"') % 2 != 0:
+        msgs.append('Unmatched double quote (").')
 
-    # Validate names
-    unknown = [c for c in caps_list if c not in VALID_CAPS]
-    if unknown:
-        if len(unknown) == 1:
-            return None, (
-                f"Unknown capability '{unknown[0]}' in path '{path}'. "
-                f"Allowed: {', '.join(sorted(VALID_CAPS))}"
-            )
-        return None, (
-            f"Unknown capabilities {unknown} in path '{path}'. "
-            f"Allowed: {', '.join(sorted(VALID_CAPS))}"
-        )
+    # Unknown keys + capabilities validation per block
+    for m in _PATH_BLOCKS.finditer(text):
+        body = m.group("body")
+        path = m.group("pat1") or m.group("pat2") or ""
 
-    return caps_list, None
-
-def preprocess_policy(policy_text: str) -> Tuple[str, bool]:
-    """Strip full-line comments that start with '#' and report if any were removed."""
-    lines = policy_text.splitlines()
-    had_comments = False
-    filtered: List[str] = []
-    for line in lines:
-        if re.match(r'^\s*#', line):
-            had_comments = True
-            continue
-        filtered.append(line)
-    return "\n".join(filtered), had_comments
-
-def hcl_syntax_check(policy_text: str) -> List[str]:
-    """
-    Lightweight HCL-like validation and capability validation.
-    Returns a list of error/warning messages (strings).
-    """
-    errors: List[str] = []
-
-    # Remove commented-out lines at the beginning of lines (keep inline comments simple)
-    policy_text, had_comments = preprocess_policy(policy_text)
-    if had_comments:
-        errors.append("[low] Commented-out rules detected (lines starting with #). Consider removing them.")
-
-    # Very lightweight structural checks
-    if policy_text.count('"') % 2 != 0:
-        errors.append('Unmatched double quote (").')
-    if policy_text.count('{') != policy_text.count('}'):
-        errors.append("Unmatched curly brace ({ or }).")
-
-    # Collect both syntaxes: path(".."){..} and path ".." {..}
-    path_blocks: List[Tuple[str, str]] = []
-    path_blocks += PATH_BLOCK_PAREN_RE.findall(policy_text)
-    path_blocks += PATH_BLOCK_LABEL_RE.findall(policy_text)
-    if not path_blocks:
-        errors.append("No valid 'path' blocks found.")
-        return errors
-
-    for path, block in path_blocks:
-        # star-in-the-middle should be flagged
+        # '*' anywhere except as suffix is likely a mistake
         if "*" in path and not path.endswith("*"):
-            errors.append(f'Invalid glob in path "{path}": "*" is only allowed as the final character.')
+            msgs.append(f'Invalid glob in path "{path}": "*" is only allowed as the final character.')
 
-        caps_match = CAPS_RE.search(block)
-        if not caps_match:
-            errors.append(f"Missing or malformed 'capabilities' in block for path: '{path}'")
+        # unknown keys (warning)
+        for km in _KEY_ASSIGN.finditer(body):
+            key = km.group(1)
+            if key.lower() != "capabilities":
+                msgs.append(f"[low] Unknown key '{key}' in block for path '{path}'.")
+
+        caps_m = _CAPS.search(body)
+        if not caps_m:
+            msgs.append(f"Missing or malformed 'capabilities' in block for path: '{path}'")
             continue
 
-        raw = caps_match.group(1).strip()
-
-        # Detect unquoted/bareword tokens inside a capabilities list (e.g., [read, list])
+        raw = caps_m.group(1).strip()
         if raw.startswith("[") and raw.endswith("]"):
-            inner = raw[1:-1]
-            # Strip quoted strings, then find barewords
-            inner_no_quotes = re.sub(r'"[^"]*"', "", inner)
-            bare = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner_no_quotes)
+            bare = _barewords_inside_list(raw)
             if bare:
-                errors.append(
+                msgs.append(
                     f"Capabilities list syntax error in path '{path}': Invalid or unquoted capabilities {bare}. "
                     "Must be quoted strings, e.g. [\"read\", \"list\"]."
                 )
-                # Skip further validation for this block to avoid duplicate messages
-                continue
+                # continue validating values; parser will still try to read quoted caps
 
-        # Normalize and validate capability names (allows list, single quoted, or single bareword)
-        caps_list, parse_err = _normalize_caps_value(raw, path)
-        if parse_err:
-            errors.append(parse_err)
+        # Now validate values (quoted list, single quoted, or bareword)
+        caps_list: List[str]
+        if raw.startswith("[") and raw.endswith("]"):
+            caps_list = re.findall(r'"([^"]+)"', raw)
+        elif raw.startswith('"') and raw.endswith('"'):
+            caps_list = [raw[1:-1]]
+        else:
+            caps_list = [raw]  # bareword
 
-    return errors
+        unknown = [c for c in caps_list if c not in VALID_CAPS]
+        if unknown:
+            if len(unknown) == 1:
+                msgs.append(f"Unknown capability '{unknown[0]}' in path '{path}'. Allowed: {', '.join(sorted(VALID_CAPS))}")
+            else:
+                msgs.append(f"Unknown capabilities {unknown} in path '{path}'. Allowed: {', '.join(sorted(VALID_CAPS))}")
 
-def parse_vault_policy(policy_text: str) -> List[Dict[str, Any]]:
-    """Return list of rules: [{'path': str, 'capabilities': List[str]}]."""
-    # Remove commented-out lines before parsing
-    policy_text, _ = preprocess_policy(policy_text)
+    # [low] commented-out rules detector
+    for i, line in enumerate(text.splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            if 'path "' in line or "capabilities" in line:
+                msgs.append("[low] Commented-out rules detected (lines starting with #). Consider removing them.")
+                break  # only one low message needed
 
-    # Collect BOTH syntaxes
-    all_blocks = []
-    all_blocks += PATH_BLOCK_PAREN_RE.findall(policy_text)
-    all_blocks += PATH_BLOCK_LABEL_RE.findall(policy_text)
+    return msgs
 
-    rules: List[Dict[str, Any]] = []
-    for path, block in all_blocks:
-        m = CAPS_RE.search(block)
-        if not m:
+def parse_vault_policy(text: str, source: str = "inline") -> List[Rule]:
+    """
+    Best-effort extraction of rules. Invalid blocks are skipped.
+    """
+    text = text or ""
+    rules: List[Rule] = []
+    for m in _PATH_BLOCKS.finditer(text):
+        full, body = m.group("full"), m.group("body")
+        path = m.group("pat1") or m.group("pat2") or ""
+        line = _lineno(text, m.start())
+
+        # Skip paths with mid-string star (invalid per policy)
+        if "*" in path and not path.endswith("*"):
             continue
-        caps_list, parse_err = _normalize_caps_value(m.group(1), path)
-        if parse_err:
-            # Skip invalid rule; syntax checker already reports the issue
+
+        caps_m = _CAPS.search(body)
+        if not caps_m:
             continue
-        rules.append({"path": path.strip(), "capabilities": caps_list})
+        raw = caps_m.group(1).strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            caps_list = re.findall(r'"([^"]+)"', raw)
+        elif raw.startswith('"') and raw.endswith('"'):
+            caps_list = [raw[1:-1]]
+        else:
+            caps_list = [raw]  # bareword
+
+        # validate capabilities; skip invalids
+        caps_set = {c for c in caps_list if c in VALID_CAPS}
+        if not caps_set:
+            continue
+
+        rules.append(Rule(path=path.strip(), capabilities=caps_set, source=source, lineno=line))
 
     return rules
