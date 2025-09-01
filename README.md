@@ -3,6 +3,7 @@
 Validate, lint, and analyze **Vault HCL policies**. Ships with a **CLI** and a **UI**.
 Parses best-effort (never blocks), reports all findings, and evaluates permissions with Vault-style precedence.
 
+[Demo](https://validator.opsatscale.com)
 ## Features
 
 * **HCL parsing & syntax checks**
